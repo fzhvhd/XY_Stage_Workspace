@@ -1,0 +1,46 @@
+# STM32CubeIDE specific files
+.metadata/
+.settings/
+
+# Build artifacts and output directories
+Debug/
+Release/
+build/
+cmake-build-*/
+
+# Object files, binaries, and other generated files
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.log
+*.launch
+
+# Prerequisites
+*.d
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Shared objects (inc. Dynamic libraries)
+*.so
+*.so.*
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Kernel Module Compile Results
+*.mod*
+*.cmd
+.tmp_versions/
+
+# Other
+*.ioc.bak
