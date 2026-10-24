@@ -185,8 +185,12 @@ typedef struct {
 #define SamplingFreq						5000.0f
 #define PrintFreq							500.0f
 
-#define SINESTEP_DURATION_SAMPLES  ((uint32_t)(2.0f * SamplingFreq))
-#define SINESTEP_SETTLE_SAMPLES    2500U  // 0.5 seconds at 5 kHz
+//#define SINESTEP_DURATION_SAMPLES  ((uint32_t)(2.0f * SamplingFreq))
+//#define SINESTEP_SETTLE_SAMPLES    2500U  // 0.5 seconds at 5 kHz
+
+#define SINESTEP_DURATION_SAMPLES  5000U
+#define SINESTEP_SETTLE_SAMPLES    2500U
+#define PDILC_N                    5000U
 
 /* USER CODE END PD */
 
@@ -231,12 +235,16 @@ volatile uint32_t LogCounter = 0;
 volatile uint32_t PrintNumbers ;
 
 
-float CURRENTLOG_V[2000];
-float CURRENTLOG_U[2000];
-float PosLog_X[2000];
-float PosLog_Y[2000];
-float PosLog_U[2000];
-float PosLog_V[2000];
+//float CURRENTLOG_V[2000];
+//float CURRENTLOG_U[2000];
+//float PosLog_X[2000];
+//float PosLog_Y[2000];
+//float PosLog_U[2000];
+//float PosLog_V[2000];
+
+// Full-trial PD-ILC buffers: one Cartesian axis initially.
+static volatile float pdilcErrorY[PDILC_N] = {0.0f};
+static volatile float pdilcCorrectionY[PDILC_N] = {0.0f};
 
 //uint32_t LogC[1000];
 //float EC_ConEffX_LOG[2000] ;
@@ -477,31 +485,58 @@ int main(void)
 
 			break;
 
+//		case PRINT_COMMAND:
+//
+//			HAL_UART_DMAStop(&huart2);
+//			for (int ii = 0; ii < PrintNumbers; ii++) {
+//				UARTTXLen = snprintf((char*) UARTTXBuffer,
+//				UART_TX_BUFFER_SIZE - 1, "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+//
+//				CURRENTLOG_U[ii], CURRENTLOG_V[ii],
+//				PosLog_U[ii],PosLog_V[ii],
+//						PosLog_X[ii], PosLog_Y[ii]);
+////						,LogC[ii]);
+////				XActuator.MC.DesiredValueX,YActuator.MC.DesiredValueX,
+////				XActuator.MC.DesiredValueY,YActuator.MC.DesiredValueY,
+////				MC_ErrX_LOG[ii],MC_ErrY_LOG[ii]);
+////				EC_ErrX_LOG[ii],EC_ErrY_LOG[ii]);
+////				EC_ConEffX_LOG[ii], EC_ConEffY_LOG[ii]);
+//
+//
+//
+//				HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen,
+//						100);
+//			}
+//			ActiveCommand = IDLE_COMMAND;
+//
+//			break;
+
 		case PRINT_COMMAND:
 
-			HAL_UART_DMAStop(&huart2);
-			for (int ii = 0; ii < PrintNumbers; ii++) {
-				UARTTXLen = snprintf((char*) UARTTXBuffer,
-				UART_TX_BUFFER_SIZE - 1, "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+		    HAL_UART_DMAStop(&huart2);
 
-				CURRENTLOG_U[ii], CURRENTLOG_V[ii],
-				PosLog_U[ii],PosLog_V[ii],
-						PosLog_X[ii], PosLog_Y[ii]);
-//						,LogC[ii]);
-//				XActuator.MC.DesiredValueX,YActuator.MC.DesiredValueX,
-//				XActuator.MC.DesiredValueY,YActuator.MC.DesiredValueY,
-//				MC_ErrX_LOG[ii],MC_ErrY_LOG[ii]);
-//				EC_ErrX_LOG[ii],EC_ErrY_LOG[ii]);
-//				EC_ConEffX_LOG[ii], EC_ConEffY_LOG[ii]);
+		    for (uint32_t ii = 0U; ii < PDILC_N; ii++) {
 
+		        UARTTXLen = snprintf(
+		            (char*)UARTTXBuffer,
+		            UART_TX_BUFFER_SIZE - 1U,
+		            "%lu,%.6f,%.6f\r\n",
+		            (unsigned long)ii,
+		            (double)pdilcErrorY[ii],
+		            (double)pdilcCorrectionY[ii]
+		        );
 
+		        HAL_UART_Transmit(
+		            &huart2,
+		            (uint8_t*)UARTTXBuffer,
+		            UARTTXLen,
+		            100
+		        );
+		    }
 
-				HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen,
-						100);
-			}
-			ActiveCommand = IDLE_COMMAND;
+		    ActiveCommand = IDLE_COMMAND;
+		    break;
 
-			break;
 
 		case CURRENT_OFFSET_COMMAND:
 			HAL_UART_DMAStop(&huart2);
@@ -613,7 +648,7 @@ int main(void)
 						STPOS = 1;
 						StartActuators();
 
-					} else if (LogCounter <=
+					} else if (LogCounter <
 					           SINESTEP_DURATION_SAMPLES + SINESTEP_SETTLE_SAMPLES) {
 ////						float omegaT = (float) LogCounter / SamplingFreq * freq_circle;
 //						float omegaT = (float) (LogCounter) / SamplingFreq * freq_circle;
@@ -2051,7 +2086,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 	// Generate the SINESTEP reference in the ISR.
 	if (ActiveCommand == SINESTEP_COMMAND) {
 
-	    if (LogCounter <= SINESTEP_DURATION_SAMPLES) {
+	    if (LogCounter < SINESTEP_DURATION_SAMPLES) {
 
 	        // Original 2 mm, 10 Hz sine trajectory.
 	        float omegaT =
@@ -2068,7 +2103,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 	            0
 	        );
 
-	    } else if (LogCounter <=
+	    } else if (LogCounter <
 	               SINESTEP_DURATION_SAMPLES + SINESTEP_SETTLE_SAMPLES) {
 
 	        // Hold the Cartesian reference at the origin.
@@ -2093,6 +2128,24 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 		case POSITION_CONTROL:
 
 			MMeasurement();
+
+			// Record the full 1-second Y tracking-error profile.
+			// LogCounter is the sample index at 5 kHz.
+			if (ActiveCommand == SINESTEP_COMMAND &&
+			    LogCounter < PDILC_N) {
+
+			    uint16_t k = (uint16_t)LogCounter;
+
+			    // Original Cartesian Y reference, without ILC correction.
+			    float yReference =
+			        R_circle * sinf(
+			            freq_circle * ((float)k / SamplingFreq)
+			        );
+
+			    // Tracking error in mm: desired position minus measured position.
+			    pdilcErrorY[k] =
+			        yReference - YActuator.MM.Position;
+			}
 
 
 
@@ -2320,34 +2373,34 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 	}
 
 
-	if (LogCounter % 5 == 0 && STPOS == 1) {
-		//&& (LogCounter > 1*SamplingFreq)
-
-		CURRENTLOG_V[PrintCounter] = YActuator.EM.Current;
-		CURRENTLOG_U[PrintCounter] = XActuator.EM.Current;
-//		CURRENTLOG_U[PrintCounter] = YActuator.MC.DesiredValueZP[0];
-		PosLog_U[PrintCounter] = XActuator.MC.posSetY;
-	    PosLog_V[PrintCounter] = YActuator.MC.posSetY;
-//		PosLog_X[PrintCounter] = YActuator.MC.DesiredValueZP_P1;
-		PosLog_X[PrintCounter] = XActuator.MM.Position;
-		PosLog_Y[PrintCounter] = YActuator.MM.Position;
-
-//		LogC[PrintCounter] = LogCounter;
-
-//		EC_ConEffX_LOG[PrintCounter] = XActuator.EC.ControlEffort[0];
-//		EC_ConEffY_LOG[PrintCounter] = YActuator.EC.ControlEffort[0];
-//		MC_ErrX_LOG[PrintCounter] = XActuator.MC.Error[0];
-//		MC_ErrY_LOG[PrintCounter] = YActuator.MC.Error[0];
-
-//		EC_ErrX_LOG[PrintCounter] = XActuator.EC.Error[0];
-//		EC_ErrY_LOG[PrintCounter] = YActuator.EC.Error[0];
-
-		PrintCounter++;
-	}
-
-	if (PrintCounter >= PrintNumbers) {
-		STPOS = 0;
-	}
+//	if (LogCounter % 5 == 0 && STPOS == 1) {
+//		//&& (LogCounter > 1*SamplingFreq)
+//
+//		CURRENTLOG_V[PrintCounter] = YActuator.EM.Current;
+//		CURRENTLOG_U[PrintCounter] = XActuator.EM.Current;
+////		CURRENTLOG_U[PrintCounter] = YActuator.MC.DesiredValueZP[0];
+//		PosLog_U[PrintCounter] = XActuator.MC.posSetY;
+//	    PosLog_V[PrintCounter] = YActuator.MC.posSetY;
+////		PosLog_X[PrintCounter] = YActuator.MC.DesiredValueZP_P1;
+//		PosLog_X[PrintCounter] = XActuator.MM.Position;
+//		PosLog_Y[PrintCounter] = YActuator.MM.Position;
+//
+////		LogC[PrintCounter] = LogCounter;
+//
+////		EC_ConEffX_LOG[PrintCounter] = XActuator.EC.ControlEffort[0];
+////		EC_ConEffY_LOG[PrintCounter] = YActuator.EC.ControlEffort[0];
+////		MC_ErrX_LOG[PrintCounter] = XActuator.MC.Error[0];
+////		MC_ErrY_LOG[PrintCounter] = YActuator.MC.Error[0];
+//
+////		EC_ErrX_LOG[PrintCounter] = XActuator.EC.Error[0];
+////		EC_ErrY_LOG[PrintCounter] = YActuator.EC.Error[0];
+//
+//		PrintCounter++;
+//	}
+//
+//	if (PrintCounter >= PrintNumbers) {
+//		STPOS = 0;
+//	}
 
 	LogCounter++;
 	HAL_GPIO_TogglePin(GPIOA,GPIO_PIN_9);
