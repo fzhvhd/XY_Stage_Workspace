@@ -188,16 +188,17 @@ typedef struct {
 //#define SINESTEP_DURATION_SAMPLES  ((uint32_t)(2.0f * SamplingFreq))
 //#define SINESTEP_SETTLE_SAMPLES    2500U  // 0.5 seconds at 5 kHz
 
-//ILC
+// ILC configuration
+#define ILC_BETA                  0.5f
+#define ILC_MAX_CORRECTION_MM     2.0f
+#define MODEL_INVERSE_Q_FC_HZ     300.0f
+#define PDILC_Q_FC_HZ             500.0f
 
-#define PDILC_KP                 0.5f
-#define PDILC_KD                15.0f
-#define PDILC_LEARNING_SCALE     1.0f
-#define PDILC_MAX_CORRECTION_MM  0.50f
-#define PDILC_Q_FC_HZ           100.0f
+#define PDILC_KP                  0.5f
+#define PDILC_KD                 15.0f
 
-#define PDILC_N                    5000U
-#define SINESTEP_DURATION_SAMPLES  PDILC_N
+#define ILC_TRIAL_SAMPLES         5000U
+#define SINESTEP_DURATION_SAMPLES ILC_TRIAL_SAMPLES
 #define SINESTEP_SETTLE_SAMPLES    2500U
 
 #define SINESTEP_TOTAL_SAMPLES \
@@ -253,9 +254,9 @@ volatile uint32_t PrintNumbers ;
 //float PosLog_U[2000];
 //float PosLog_V[2000];
 
-// Full-trial PD-ILC buffers: one Cartesian axis initially.
-static volatile float pdilcErrorY[PDILC_N] = {0.0f};
-static volatile float pdilcCorrectionY[PDILC_N] = {0.0f};
+// Full-trial ILC buffers for the Y axis; shared by both update laws.
+static volatile float ilcErrorY[ILC_TRIAL_SAMPLES] = {0.0f};
+static volatile float ilcCorrectionY[ILC_TRIAL_SAMPLES] = {0.0f};
 
 //uint32_t LogC[1000];
 //float EC_ConEffX_LOG[2000] ;
@@ -275,7 +276,7 @@ static volatile float pdilcCorrectionY[PDILC_N] = {0.0f};
 
 volatile uint32_t PrintNumbers = 2000;
 const float R_circle =  2.0f;                 //radius of circle
-const float freq_circle = 5.0f *M_PI*2.0f;   //frequency
+const float freq_circle = 10.0f * M_PI * 2.0f; // frequency
 
 const float petal_freq = 2.0f * (2.0f * M_PI);   // = π/2 ≈ 1.5708
 const float petal_dim =  3.0f;                 //radius of circle
@@ -356,9 +357,9 @@ void ReInitMechanicalController();
 
 //ILC
 static void PDILC_Update(void);
-static void ModelInverseILC_Update();
-static float PDILC_CalculateRMS(void);
-static float PDILC_MaxCorrection(void);
+static void ModelInverseILC_Update(void);
+static float ILC_CalculateRMS(void);
+static float ILC_MaxCorrection(void);
 
 /* USER CODE END PFP */
 
@@ -532,15 +533,15 @@ int main(void)
 
 		    HAL_UART_DMAStop(&huart2);
 
-		    for (uint32_t ii = 0U; ii < PDILC_N; ii++) {
+		    for (uint32_t ii = 0U; ii < ILC_TRIAL_SAMPLES; ii++) {
 
 		        UARTTXLen = snprintf(
 		            (char*)UARTTXBuffer,
 		            UART_TX_BUFFER_SIZE - 1U,
 		            "%lu,%.6f,%.6f\r\n",
 		            (unsigned long)ii,
-		            (double)pdilcErrorY[ii],
-		            (double)pdilcCorrectionY[ii]
+		            (double)ilcErrorY[ii],
+		            (double)ilcCorrectionY[ii]
 		        );
 
 		        HAL_UART_Transmit(
@@ -689,12 +690,12 @@ int main(void)
 
 					    StopActuators();
 
-					    float errorRMS = PDILC_CalculateRMS();
+					    float errorRMS = ILC_CalculateRMS();
 
-//					    PDILC_Update();
-					    ModelInverseILC_Update();
+					    PDILC_Update();
+//					    ModelInverseILC_Update();
 
-					    float correctionPeak = PDILC_MaxCorrection();
+					    float correctionPeak = ILC_MaxCorrection();
 
 					    ActiveCommand = IDLE_COMMAND;
 					    STPOS = 0;
@@ -2107,25 +2108,25 @@ void LogData() {
 }
 
 //ILC
-static float PDILC_CalculateRMS(void)
+static float ILC_CalculateRMS(void)
 {
     float sum = 0.0f;
 
-    for (uint16_t k = 0U; k < PDILC_N; k++) {
-        float e = pdilcErrorY[k];
+    for (uint16_t k = 0U; k < ILC_TRIAL_SAMPLES; k++) {
+        float e = ilcErrorY[k];
         sum += e * e;
     }
 
-    return sqrtf(sum / (float)PDILC_N);
+    return sqrtf(sum / (float)ILC_TRIAL_SAMPLES);
 }
 
 
-static float PDILC_MaxCorrection(void)
+static float ILC_MaxCorrection(void)
 {
     float peak = 0.0f;
 
-    for (uint16_t k = 0U; k < PDILC_N; k++) {
-        float u = fabsf(pdilcCorrectionY[k]);
+    for (uint16_t k = 0U; k < ILC_TRIAL_SAMPLES; k++) {
+        float u = fabsf(ilcCorrectionY[k]);
 
         if (u > peak) {
             peak = u;
@@ -2139,10 +2140,7 @@ static void PDILC_Update(void)
 {
     const float pi = 3.14159265358979323846f;
 
-    // Match the Q-filter cutoff used in the Simulink simulation.
-    const float qFcHz = 500.0f;
-
-    const float K = tanf(pi * qFcHz / SamplingFreq);
+    const float K = tanf(pi * PDILC_Q_FC_HZ / SamplingFreq);
     const float sqrt2 = 1.41421356237f;
 
     const float norm =
@@ -2168,31 +2166,31 @@ static void PDILC_Update(void)
      *                + Kd * (e_j[k+1] - e_j[k])
      *              )
      */
-    for (uint16_t k = 0U; k < PDILC_N; k++) {
+    for (uint16_t k = 0U; k < ILC_TRIAL_SAMPLES; k++) {
 
         uint16_t kp1 =
-            (k < PDILC_N - 1U) ? (k + 1U) : k;
+            (k < ILC_TRIAL_SAMPLES - 1U) ? (k + 1U) : k;
 
-        float e  = pdilcErrorY[k];
-        float en = pdilcErrorY[kp1];
+        float e  = ilcErrorY[k];
+        float en = ilcErrorY[kp1];
 
         float delta =
             PDILC_KP * en
             + PDILC_KD * (en - e);
 
         float nextU =
-            pdilcCorrectionY[k]
-            + PDILC_LEARNING_SCALE * delta;
+            ilcCorrectionY[k]
+            + delta;
 
         // Preserve the existing correction limit.
-        if (nextU > PDILC_MAX_CORRECTION_MM) {
-            nextU = PDILC_MAX_CORRECTION_MM;
-        } else if (nextU < -PDILC_MAX_CORRECTION_MM) {
-            nextU = -PDILC_MAX_CORRECTION_MM;
+        if (nextU > ILC_MAX_CORRECTION_MM) {
+            nextU = ILC_MAX_CORRECTION_MM;
+        } else if (nextU < -ILC_MAX_CORRECTION_MM) {
+            nextU = -ILC_MAX_CORRECTION_MM;
         }
 
         // Store the unfiltered candidate temporarily.
-        pdilcCorrectionY[k] = nextU;
+        ilcCorrectionY[k] = nextU;
     }
 
 
@@ -2203,21 +2201,21 @@ static void PDILC_Update(void)
      * The active implementation below uses only a causal
      * forward pass.
      *
-     * float x1 = pdilcCorrectionY[0];
+     * float x1 = ilcCorrectionY[0];
      * float x2 = x1;
      * float y1 = x1;
      * float y2 = x1;
      *
      * // Forward pass.
-     * for (uint16_t k = 0U; k < PDILC_N; k++) {
+     * for (uint16_t k = 0U; k < ILC_TRIAL_SAMPLES; k++) {
      *
-     *     float x = pdilcCorrectionY[k];
+     *     float x = ilcCorrectionY[k];
      *
      *     float y =
      *         b0 * x + b1 * x1 + b2 * x2
      *         - a1 * y1 - a2 * y2;
      *
-     *     pdilcCorrectionY[k] = y;
+     *     ilcCorrectionY[k] = y;
      *
      *     x2 = x1;
      *     x1 = x;
@@ -2226,21 +2224,21 @@ static void PDILC_Update(void)
      * }
      *
      * // Reverse pass.
-     * x1 = pdilcCorrectionY[PDILC_N - 1U];
+     * x1 = ilcCorrectionY[ILC_TRIAL_SAMPLES - 1U];
      * x2 = x1;
      * y1 = x1;
      * y2 = x1;
      *
-     * for (int32_t k = (int32_t)PDILC_N - 1;
+     * for (int32_t k = (int32_t)ILC_TRIAL_SAMPLES - 1;
      *      k >= 0; k--) {
      *
-     *     float x = pdilcCorrectionY[k];
+     *     float x = ilcCorrectionY[k];
      *
      *     float y =
      *         b0 * x + b1 * x1 + b2 * x2
      *         - a1 * y1 - a2 * y2;
      *
-     *     pdilcCorrectionY[k] = y;
+     *     ilcCorrectionY[k] = y;
      *
      *     x2 = x1;
      *     x1 = x;
@@ -2263,10 +2261,10 @@ static void PDILC_Update(void)
     float y1 = 0.0f;
     float y2 = 0.0f;
 
-    for (uint16_t k = 0U; k < PDILC_N; k++) {
+    for (uint16_t k = 0U; k < ILC_TRIAL_SAMPLES; k++) {
 
         // Current unfiltered candidate.
-        float x = pdilcCorrectionY[k];
+        float x = ilcCorrectionY[k];
 
         // Causal IIR filter output.
         float y =
@@ -2277,7 +2275,7 @@ static void PDILC_Update(void)
             - a2 * y2;
 
         // Replace the candidate with its filtered value.
-        pdilcCorrectionY[k] = y;
+        ilcCorrectionY[k] = y;
 
         // Advance the input and output histories.
         x2 = x1;
@@ -2291,24 +2289,24 @@ static void PDILC_Update(void)
     /*
      * 4. Preserve the existing endpoint constraints.
      */
-    pdilcCorrectionY[0] = 0.0f;
-    pdilcCorrectionY[PDILC_N - 1U] = 0.0f;
+    ilcCorrectionY[0] = 0.0f;
+    ilcCorrectionY[ILC_TRIAL_SAMPLES - 1U] = 0.0f;
 
 
     /*
      * 5. Preserve the existing correction limit.
      */
-    for (uint16_t k = 0U; k < PDILC_N; k++) {
+    for (uint16_t k = 0U; k < ILC_TRIAL_SAMPLES; k++) {
 
-        float u = pdilcCorrectionY[k];
+        float u = ilcCorrectionY[k];
 
-        if (u > PDILC_MAX_CORRECTION_MM) {
-            u = PDILC_MAX_CORRECTION_MM;
-        } else if (u < -PDILC_MAX_CORRECTION_MM) {
-            u = -PDILC_MAX_CORRECTION_MM;
+        if (u > ILC_MAX_CORRECTION_MM) {
+            u = ILC_MAX_CORRECTION_MM;
+        } else if (u < -ILC_MAX_CORRECTION_MM) {
+            u = -ILC_MAX_CORRECTION_MM;
         }
 
-        pdilcCorrectionY[k] = u;
+        ilcCorrectionY[k] = u;
     }
 }
 
@@ -2323,20 +2321,15 @@ static void ModelInverseILC_Update(void)
     const float a2Plant =  2.62331485857184f;
     const float a3Plant = -0.814023391722133f;
 
-    /* Model-inverse ILC parameters */
-    const float beta = 0.5f;
-    const float qFcHz = 300.0f;
-
     const float pi = 3.14159265358979323846f;
     const float sqrt2 = 1.4142135623730951f;
-    const float correctionLimit = PDILC_MAX_CORRECTION_MM;
+    const float correctionLimit = ILC_MAX_CORRECTION_MM;
 
     /*
      * Design a second-order Butterworth low-pass filter.
-     * These coefficients correspond to MATLAB:
-     * [b,a] = butter(2, 500/(5000/2));
+     * The cutoff is configured by MODEL_INVERSE_Q_FC_HZ above.
      */
-    const float K = tanf(pi * qFcHz / SamplingFreq);
+    const float K = tanf(pi * MODEL_INVERSE_Q_FC_HZ / SamplingFreq);
     const float K2 = K * K;
     const float qDen = 1.0f + sqrt2 * K + K2;
 
@@ -2361,18 +2354,18 @@ static void ModelInverseILC_Update(void)
      * Update the existing correction:
      * u_next = u_previous + beta*(L*e)
      */
-    float eMinus1 = pdilcErrorY[0];
-    float eMinus2 = pdilcErrorY[0];
+    float eMinus1 = ilcErrorY[0];
+    float eMinus2 = ilcErrorY[0];
     float inversePrevious = 0.0f;
 
-    for (uint32_t k = 0U; k < PDILC_N; ++k)
+    for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k)
     {
-        const float eNow = pdilcErrorY[k];
+        const float eNow = ilcErrorY[k];
 
         const float eNext =
-            (k < (PDILC_N - 1U))
-            ? pdilcErrorY[k + 1U]
-            : pdilcErrorY[k];
+            (k < (ILC_TRIAL_SAMPLES - 1U))
+            ? ilcErrorY[k + 1U]
+            : ilcErrorY[k];
 
         const float inverseCorrection =
             (eNext
@@ -2382,7 +2375,7 @@ static void ModelInverseILC_Update(void)
              - b2Plant * inversePrevious) / b1Plant;
 
         float nextCorrection =
-            pdilcCorrectionY[k] + beta * inverseCorrection;
+            ilcCorrectionY[k] + ILC_BETA * inverseCorrection;
 
         /* Hardware safeguard before Q-filtering */
         if (nextCorrection > correctionLimit)
@@ -2394,7 +2387,7 @@ static void ModelInverseILC_Update(void)
             nextCorrection = -correctionLimit;
         }
 
-        pdilcCorrectionY[k] = nextCorrection;
+        ilcCorrectionY[k] = nextCorrection;
 
         /* Update previous-error history */
         eMinus2 = eMinus1;
@@ -2417,9 +2410,9 @@ static void ModelInverseILC_Update(void)
     float y1 = 0.0f;
     float y2 = 0.0f;
 
-    for (uint32_t k = 0U; k < PDILC_N; ++k)
+    for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k)
     {
-        const float x = pdilcCorrectionY[k];
+        const float x = ilcCorrectionY[k];
 
         const float y =
               qB0 * x
@@ -2443,7 +2436,7 @@ static void ModelInverseILC_Update(void)
             filteredCorrection = -correctionLimit;
         }
 
-        pdilcCorrectionY[k] = filteredCorrection;
+        ilcCorrectionY[k] = filteredCorrection;
 
         x2 = x1;
         x1 = x;
@@ -2472,7 +2465,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
 	        // Apply the learned correction.
 	        float commandedY =
-	            nominalY + pdilcCorrectionY[k];
+	            nominalY + ilcCorrectionY[k];
 
 	        SetControlParameters(
 	            1,
@@ -2512,7 +2505,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 			// Record the full 1-second Y tracking-error profile.
 			// LogCounter is the sample index at 5 kHz.
 			if (ActiveCommand == SINESTEP_COMMAND &&
-			    LogCounter < PDILC_N) {
+			    LogCounter < ILC_TRIAL_SAMPLES) {
 
 			    uint16_t k = (uint16_t)LogCounter;
 
@@ -2523,7 +2516,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 			        );
 
 			    // Tracking error in mm: desired position minus measured position.
-			    pdilcErrorY[k] =
+			    ilcErrorY[k] =
 			        yReference - YActuator.MM.Position;
 			}
 
