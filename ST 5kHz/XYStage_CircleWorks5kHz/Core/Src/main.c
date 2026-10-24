@@ -185,6 +185,9 @@ typedef struct {
 #define SamplingFreq						5000.0f
 #define PrintFreq							500.0f
 
+#define SINESTEP_DURATION_SAMPLES  ((uint32_t)(2.0f * SamplingFreq))
+#define SINESTEP_SETTLE_SAMPLES    2500U  // 0.5 seconds at 5 kHz
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -610,7 +613,8 @@ int main(void)
 						STPOS = 1;
 						StartActuators();
 
-					} else if (LogCounter <= 2.0 * SamplingFreq) {
+					} else if (LogCounter <=
+					           SINESTEP_DURATION_SAMPLES + SINESTEP_SETTLE_SAMPLES) {
 ////						float omegaT = (float) LogCounter / SamplingFreq * freq_circle;
 //						float omegaT = (float) (LogCounter) / SamplingFreq * freq_circle;
 //										SetControlParameters(1, POSITION_CONTROL,
@@ -618,16 +622,38 @@ int main(void)
 //												DONT_CHANGE_IT, 0, 0, 0);
 
 
-					} else if (LogCounter > 2.0 * SamplingFreq) {
+					} else {
 
-						SetControlParameters(0, MEASUREMENT_ONLY, 0, 0,
-						MEASUREMENT_ONLY, 0, 0, 0);
-						StopActuators();
-						ActiveCommand = IDLE_COMMAND;
-						STPOS = 0;
-						UARTTXLen = sprintf((char*) UARTTXBuffer, "Finished\n");
-						HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen,
-								100);
+					    SetControlParameters(
+					        0,
+					        MEASUREMENT_ONLY,
+					        0.0f,
+					        0.0f,
+					        MEASUREMENT_ONLY,
+					        0.0f,
+					        0.0f,
+					        0
+					    );
+
+					    StopActuators();
+
+					    ActiveCommand = IDLE_COMMAND;
+					    STPOS = 0;
+
+					    UARTTXLen = snprintf(
+					        (char*)UARTTXBuffer,
+					        UART_TX_BUFFER_SIZE - 1U,
+					        "Finished. Final X=%.4f mm, Y=%.4f mm\r\n",
+					        XActuator.MM.Position,
+					        YActuator.MM.Position
+					    );
+
+					    HAL_UART_Transmit(
+					        &huart2,
+					        (uint8_t*)UARTTXBuffer,
+					        UARTTXLen,
+					        100
+					    );
 					}
 					break;
 		case STAIR_COMMAND:
@@ -2022,23 +2048,42 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
 //	HAL_GPIO_TogglePin(GPIOA,GPIO_PIN_9);
 
-	// Update the SINESTEP reference at the control sampling rate.
-	if (ActiveCommand == SINESTEP_COMMAND &&
-	    LogCounter <= (uint32_t)(2.0f * SamplingFreq)) {
+	// Generate the SINESTEP reference in the ISR.
+	if (ActiveCommand == SINESTEP_COMMAND) {
 
-	    float omegaT =
-	        (float)(LogCounter) / SamplingFreq * freq_circle;
+	    if (LogCounter <= SINESTEP_DURATION_SAMPLES) {
 
-	    SetControlParameters(
-	        1U,
-	        POSITION_CONTROL,
-	        0.0f,
-	        R_circle * sinf(omegaT),
-	        DONT_CHANGE_IT,
-	        0.0f,
-	        0.0f,
-	        0U
-	    );
+	        // Original 2 mm, 10 Hz sine trajectory.
+	        float omegaT =
+	            (float)LogCounter / SamplingFreq * freq_circle;
+
+	        SetControlParameters(
+	            1,
+	            POSITION_CONTROL,
+	            0.0f,
+	            R_circle * sinf(omegaT),
+	            DONT_CHANGE_IT,
+	            0.0f,
+	            0.0f,
+	            0
+	        );
+
+	    } else if (LogCounter <=
+	               SINESTEP_DURATION_SAMPLES + SINESTEP_SETTLE_SAMPLES) {
+
+	        // Hold the Cartesian reference at the origin.
+	        // Keep feedback active so the stage can settle.
+	        SetControlParameters(
+	            1,
+	            POSITION_CONTROL,
+	            0.0f,
+	            0.0f,
+	            DONT_CHANGE_IT,
+	            0.0f,
+	            0.0f,
+	            0
+	        );
+	    }
 	}
 
 	if (YActuator.ControllerActive) {
