@@ -356,6 +356,7 @@ void ReInitMechanicalController();
 
 //ILC
 static void PDILC_Update(void);
+static void ModelInverseILC_Update();
 static float PDILC_CalculateRMS(void);
 static float PDILC_MaxCorrection(void);
 
@@ -690,7 +691,8 @@ int main(void)
 
 					    float errorRMS = PDILC_CalculateRMS();
 
-					    PDILC_Update();
+//					    PDILC_Update();
+					    ModelInverseILC_Update();
 
 					    float correctionPeak = PDILC_MaxCorrection();
 
@@ -2310,6 +2312,147 @@ static void PDILC_Update(void)
     }
 }
 
+
+static void ModelInverseILC_Update(void)
+{
+    /* Identified Y-axis closed-loop model coefficients, Fs = 5000 Hz */
+    const float b1Plant =  0.00441711513541465f;
+    const float b2Plant = -0.00437002549102584f;
+
+    const float a1Plant = -2.80924504797830f;
+    const float a2Plant =  2.62331485857184f;
+    const float a3Plant = -0.814023391722133f;
+
+    /* Model-inverse ILC parameters */
+    const float beta = 0.5f;
+    const float qFcHz = 300.0f;
+
+    const float pi = 3.14159265358979323846f;
+    const float sqrt2 = 1.4142135623730951f;
+    const float correctionLimit = PDILC_MAX_CORRECTION_MM;
+
+    /*
+     * Design a second-order Butterworth low-pass filter.
+     * These coefficients correspond to MATLAB:
+     * [b,a] = butter(2, 500/(5000/2));
+     */
+    const float K = tanf(pi * qFcHz / SamplingFreq);
+    const float K2 = K * K;
+    const float qDen = 1.0f + sqrt2 * K + K2;
+
+    const float qB0 = K2 / qDen;
+    const float qB1 = 2.0f * K2 / qDen;
+    const float qB2 = K2 / qDen;
+
+    const float qA1 = 2.0f * (K2 - 1.0f) / qDen;
+    const float qA2 = (1.0f - sqrt2 * K + K2) / qDen;
+
+    /*
+     * Stage 1: Apply the inverse model to the recorded error.
+     *
+     * L*e[k] =
+     * (e[k+1] + a1*e[k] + a2*e[k-1] + a3*e[k-2]
+     *  - b2*L*e[k-1]) / b1
+     *
+     * Boundary convention matches the standalone MATLAB code:
+     * e[k-1] and e[k-2] initially use e[0].
+     * At the last sample, e[k+1] uses e[last].
+     *
+     * Update the existing correction:
+     * u_next = u_previous + beta*(L*e)
+     */
+    float eMinus1 = pdilcErrorY[0];
+    float eMinus2 = pdilcErrorY[0];
+    float inversePrevious = 0.0f;
+
+    for (uint32_t k = 0U; k < PDILC_N; ++k)
+    {
+        const float eNow = pdilcErrorY[k];
+
+        const float eNext =
+            (k < (PDILC_N - 1U))
+            ? pdilcErrorY[k + 1U]
+            : pdilcErrorY[k];
+
+        const float inverseCorrection =
+            (eNext
+             + a1Plant * eNow
+             + a2Plant * eMinus1
+             + a3Plant * eMinus2
+             - b2Plant * inversePrevious) / b1Plant;
+
+        float nextCorrection =
+            pdilcCorrectionY[k] + beta * inverseCorrection;
+
+        /* Hardware safeguard before Q-filtering */
+        if (nextCorrection > correctionLimit)
+        {
+            nextCorrection = correctionLimit;
+        }
+        else if (nextCorrection < -correctionLimit)
+        {
+            nextCorrection = -correctionLimit;
+        }
+
+        pdilcCorrectionY[k] = nextCorrection;
+
+        /* Update previous-error history */
+        eMinus2 = eMinus1;
+        eMinus1 = eNow;
+
+        /* Update inverse-model history */
+        inversePrevious = inverseCorrection;
+    }
+
+    /*
+     * Stage 2: Causal Q-filter.
+     *
+     * The correction array is filtered in place, so no additional
+     * 5000-sample buffer is needed.
+     *
+     * Zero initial filter states, as with MATLAB filter(b,a,x).
+     */
+    float x1 = 0.0f;
+    float x2 = 0.0f;
+    float y1 = 0.0f;
+    float y2 = 0.0f;
+
+    for (uint32_t k = 0U; k < PDILC_N; ++k)
+    {
+        const float x = pdilcCorrectionY[k];
+
+        const float y =
+              qB0 * x
+            + qB1 * x1
+            + qB2 * x2
+            - qA1 * y1
+            - qA2 * y2;
+
+        /* Preserve the filter's internal state before output limiting */
+        const float yState = y;
+
+        float filteredCorrection = y;
+
+        /* Hardware safeguard after Q-filtering */
+        if (filteredCorrection > correctionLimit)
+        {
+            filteredCorrection = correctionLimit;
+        }
+        else if (filteredCorrection < -correctionLimit)
+        {
+            filteredCorrection = -correctionLimit;
+        }
+
+        pdilcCorrectionY[k] = filteredCorrection;
+
+        x2 = x1;
+        x1 = x;
+
+        y2 = y1;
+        y1 = yState;
+    }
+}
+
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
 //	HAL_GPIO_TogglePin(GPIOA,GPIO_PIN_9);
@@ -2386,7 +2529,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
 
 
-//			 ZPETC
+//			 //ZPETC
 
 //
 //			YActuator.MC.DesiredValueZP_P1 = (float)YActuator.MC.DesiredValue;
