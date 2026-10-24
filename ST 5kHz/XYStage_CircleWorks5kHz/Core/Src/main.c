@@ -253,7 +253,7 @@ float PosLog_V[2000];
 
 volatile uint32_t PrintNumbers = 2000;
 const float R_circle =  2.0f;                 //radius of circle
-const float freq_circle = 10.0f *M_PI*2.0f;   //frequency
+const float freq_circle = 5.0f *M_PI*2.0f;   //frequency
 
 const float petal_freq = 2.0f * (2.0f * M_PI);   // = π/2 ≈ 1.5708
 const float petal_dim =  3.0f;                 //radius of circle
@@ -611,11 +611,11 @@ int main(void)
 						StartActuators();
 
 					} else if (LogCounter <= 2.0 * SamplingFreq) {
-//						float omegaT = (float) LogCounter / SamplingFreq * freq_circle;
-						float omegaT = (float) (LogCounter+1) / SamplingFreq * freq_circle;
-										SetControlParameters(1, POSITION_CONTROL,
-												0, R_circle * sinf(omegaT),
-												DONT_CHANGE_IT, 0, 0, 0);
+////						float omegaT = (float) LogCounter / SamplingFreq * freq_circle;
+//						float omegaT = (float) (LogCounter) / SamplingFreq * freq_circle;
+//										SetControlParameters(1, POSITION_CONTROL,
+//												0, R_circle * sinf(omegaT),
+//												DONT_CHANGE_IT, 0, 0, 0);
 
 
 					} else if (LogCounter > 2.0 * SamplingFreq) {
@@ -2020,7 +2020,26 @@ void LogData() {
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
-	HAL_GPIO_TogglePin(GPIOA,GPIO_PIN_9);
+//	HAL_GPIO_TogglePin(GPIOA,GPIO_PIN_9);
+
+	// Update the SINESTEP reference at the control sampling rate.
+	if (ActiveCommand == SINESTEP_COMMAND &&
+	    LogCounter <= (uint32_t)(2.0f * SamplingFreq)) {
+
+	    float omegaT =
+	        (float)(LogCounter) / SamplingFreq * freq_circle;
+
+	    SetControlParameters(
+	        1U,
+	        POSITION_CONTROL,
+	        0.0f,
+	        R_circle * sinf(omegaT),
+	        DONT_CHANGE_IT,
+	        0.0f,
+	        0.0f,
+	        0U
+	    );
+	}
 
 	if (YActuator.ControllerActive) {
 
