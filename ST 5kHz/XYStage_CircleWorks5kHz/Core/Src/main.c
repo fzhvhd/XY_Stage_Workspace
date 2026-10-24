@@ -188,9 +188,20 @@ typedef struct {
 //#define SINESTEP_DURATION_SAMPLES  ((uint32_t)(2.0f * SamplingFreq))
 //#define SINESTEP_SETTLE_SAMPLES    2500U  // 0.5 seconds at 5 kHz
 
-#define SINESTEP_DURATION_SAMPLES  5000U
-#define SINESTEP_SETTLE_SAMPLES    2500U
+//ILC
+
+#define PDILC_KP                 0.5f
+#define PDILC_KD                15.0f
+#define PDILC_LEARNING_SCALE     1.0f
+#define PDILC_MAX_CORRECTION_MM  0.50f
+#define PDILC_Q_FC_HZ           100.0f
+
 #define PDILC_N                    5000U
+#define SINESTEP_DURATION_SAMPLES  PDILC_N
+#define SINESTEP_SETTLE_SAMPLES    2500U
+
+#define SINESTEP_TOTAL_SAMPLES \
+    (SINESTEP_DURATION_SAMPLES + SINESTEP_SETTLE_SAMPLES)
 
 /* USER CODE END PD */
 
@@ -342,6 +353,11 @@ void MMeasurement();
 void EMeasurement();
 void LogData();
 void ReInitMechanicalController();
+
+//ILC
+static void PDILC_Update(void);
+static float PDILC_CalculateRMS(void);
+static float PDILC_MaxCorrection(void);
 
 /* USER CODE END PFP */
 
@@ -672,15 +688,24 @@ int main(void)
 
 					    StopActuators();
 
+					    float errorRMS = PDILC_CalculateRMS();
+
+					    PDILC_Update();
+
+					    float correctionPeak = PDILC_MaxCorrection();
+
 					    ActiveCommand = IDLE_COMMAND;
 					    STPOS = 0;
 
 					    UARTTXLen = snprintf(
 					        (char*)UARTTXBuffer,
 					        UART_TX_BUFFER_SIZE - 1U,
-					        "Finished. Final X=%.4f mm, Y=%.4f mm\r\n",
+					        "Finished. X=%.4f mm, Y=%.4f mm, "
+					        "RMS_Y=%.6f mm, correction_peak=%.5f mm\r\n",
 					        XActuator.MM.Position,
-					        YActuator.MM.Position
+					        YActuator.MM.Position,
+					        errorRMS,
+					        correctionPeak
 					    );
 
 					    HAL_UART_Transmit(
@@ -2079,6 +2104,212 @@ void LogData() {
 
 }
 
+//ILC
+static float PDILC_CalculateRMS(void)
+{
+    float sum = 0.0f;
+
+    for (uint16_t k = 0U; k < PDILC_N; k++) {
+        float e = pdilcErrorY[k];
+        sum += e * e;
+    }
+
+    return sqrtf(sum / (float)PDILC_N);
+}
+
+
+static float PDILC_MaxCorrection(void)
+{
+    float peak = 0.0f;
+
+    for (uint16_t k = 0U; k < PDILC_N; k++) {
+        float u = fabsf(pdilcCorrectionY[k]);
+
+        if (u > peak) {
+            peak = u;
+        }
+    }
+
+    return peak;
+}
+
+static void PDILC_Update(void)
+{
+    const float pi = 3.14159265358979323846f;
+
+    // Match the Q-filter cutoff used in the Simulink simulation.
+    const float qFcHz = 500.0f;
+
+    const float K = tanf(pi * qFcHz / SamplingFreq);
+    const float sqrt2 = 1.41421356237f;
+
+    const float norm =
+        1.0f / (1.0f + sqrt2 * K + K * K);
+
+    const float b0 = K * K * norm;
+    const float b1 = 2.0f * b0;
+    const float b2 = b0;
+
+    const float a1 =
+        2.0f * (K * K - 1.0f) * norm;
+
+    const float a2 =
+        (1.0f - sqrt2 * K + K * K) * norm;
+
+
+    /*
+     * 1. Calculate the unfiltered PD-ILC update.
+     *
+     * v_(j+1)[k] = u_j[k]
+     *            + gamma * (
+     *                Kp * e_j[k+1]
+     *                + Kd * (e_j[k+1] - e_j[k])
+     *              )
+     */
+    for (uint16_t k = 0U; k < PDILC_N; k++) {
+
+        uint16_t kp1 =
+            (k < PDILC_N - 1U) ? (k + 1U) : k;
+
+        float e  = pdilcErrorY[k];
+        float en = pdilcErrorY[kp1];
+
+        float delta =
+            PDILC_KP * en
+            + PDILC_KD * (en - e);
+
+        float nextU =
+            pdilcCorrectionY[k]
+            + PDILC_LEARNING_SCALE * delta;
+
+        // Preserve the existing correction limit.
+        if (nextU > PDILC_MAX_CORRECTION_MM) {
+            nextU = PDILC_MAX_CORRECTION_MM;
+        } else if (nextU < -PDILC_MAX_CORRECTION_MM) {
+            nextU = -PDILC_MAX_CORRECTION_MM;
+        }
+
+        // Store the unfiltered candidate temporarily.
+        pdilcCorrectionY[k] = nextU;
+    }
+
+
+    /*
+     * 2. ORIGINAL FORWARD-BACKWARD FILTER IMPLEMENTATION
+     *
+     * Disabled and retained for reference.
+     * The active implementation below uses only a causal
+     * forward pass.
+     *
+     * float x1 = pdilcCorrectionY[0];
+     * float x2 = x1;
+     * float y1 = x1;
+     * float y2 = x1;
+     *
+     * // Forward pass.
+     * for (uint16_t k = 0U; k < PDILC_N; k++) {
+     *
+     *     float x = pdilcCorrectionY[k];
+     *
+     *     float y =
+     *         b0 * x + b1 * x1 + b2 * x2
+     *         - a1 * y1 - a2 * y2;
+     *
+     *     pdilcCorrectionY[k] = y;
+     *
+     *     x2 = x1;
+     *     x1 = x;
+     *     y2 = y1;
+     *     y1 = y;
+     * }
+     *
+     * // Reverse pass.
+     * x1 = pdilcCorrectionY[PDILC_N - 1U];
+     * x2 = x1;
+     * y1 = x1;
+     * y2 = x1;
+     *
+     * for (int32_t k = (int32_t)PDILC_N - 1;
+     *      k >= 0; k--) {
+     *
+     *     float x = pdilcCorrectionY[k];
+     *
+     *     float y =
+     *         b0 * x + b1 * x1 + b2 * x2
+     *         - a1 * y1 - a2 * y2;
+     *
+     *     pdilcCorrectionY[k] = y;
+     *
+     *     x2 = x1;
+     *     x1 = x;
+     *     y2 = y1;
+     *     y1 = y;
+     * }
+     */
+
+
+    /*
+     * 3. CAUSAL Q-FILTER
+     *
+     * Apply one forward pass using the second-order
+     * Butterworth difference equation.
+     *
+     * Zero initial conditions, as in MATLAB filter(b,a,x).
+     */
+    float x1 = 0.0f;
+    float x2 = 0.0f;
+    float y1 = 0.0f;
+    float y2 = 0.0f;
+
+    for (uint16_t k = 0U; k < PDILC_N; k++) {
+
+        // Current unfiltered candidate.
+        float x = pdilcCorrectionY[k];
+
+        // Causal IIR filter output.
+        float y =
+            b0 * x
+            + b1 * x1
+            + b2 * x2
+            - a1 * y1
+            - a2 * y2;
+
+        // Replace the candidate with its filtered value.
+        pdilcCorrectionY[k] = y;
+
+        // Advance the input and output histories.
+        x2 = x1;
+        x1 = x;
+
+        y2 = y1;
+        y1 = y;
+    }
+
+
+    /*
+     * 4. Preserve the existing endpoint constraints.
+     */
+    pdilcCorrectionY[0] = 0.0f;
+    pdilcCorrectionY[PDILC_N - 1U] = 0.0f;
+
+
+    /*
+     * 5. Preserve the existing correction limit.
+     */
+    for (uint16_t k = 0U; k < PDILC_N; k++) {
+
+        float u = pdilcCorrectionY[k];
+
+        if (u > PDILC_MAX_CORRECTION_MM) {
+            u = PDILC_MAX_CORRECTION_MM;
+        } else if (u < -PDILC_MAX_CORRECTION_MM) {
+            u = -PDILC_MAX_CORRECTION_MM;
+        }
+
+        pdilcCorrectionY[k] = u;
+    }
+}
+
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
 //	HAL_GPIO_TogglePin(GPIOA,GPIO_PIN_9);
@@ -2088,26 +2319,32 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
 	    if (LogCounter < SINESTEP_DURATION_SAMPLES) {
 
-	        // Original 2 mm, 10 Hz sine trajectory.
-	        float omegaT =
-	            (float)LogCounter / SamplingFreq * freq_circle;
+	        uint16_t k = (uint16_t)LogCounter;
+
+	        // Original reference.
+	        float nominalY =
+	            R_circle * sinf(
+	                freq_circle * ((float)k / SamplingFreq)
+	            );
+
+	        // Apply the learned correction.
+	        float commandedY =
+	            nominalY + pdilcCorrectionY[k];
 
 	        SetControlParameters(
 	            1,
 	            POSITION_CONTROL,
 	            0.0f,
-	            R_circle * sinf(omegaT),
+	            commandedY,
 	            DONT_CHANGE_IT,
 	            0.0f,
 	            0.0f,
 	            0
 	        );
 
-	    } else if (LogCounter <
-	               SINESTEP_DURATION_SAMPLES + SINESTEP_SETTLE_SAMPLES) {
+	    } else if (LogCounter < SINESTEP_TOTAL_SAMPLES) {
 
-	        // Hold the Cartesian reference at the origin.
-	        // Keep feedback active so the stage can settle.
+	        // Return to the origin with feedback still enabled.
 	        SetControlParameters(
 	            1,
 	            POSITION_CONTROL,
