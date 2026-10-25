@@ -198,6 +198,7 @@ typedef struct {
 #define PDILC_KD                 15.0f
 
 #define ILC_TRIAL_SAMPLES         5000U
+#define ILC_RMS_START_SAMPLE      1000U  // 1-based sample number; steady RMS includes samples 1000 through 5000.
 #define SINESTEP_DURATION_SAMPLES ILC_TRIAL_SAMPLES
 #define SINESTEP_SETTLE_SAMPLES    2500U
 
@@ -359,6 +360,7 @@ void ReInitMechanicalController();
 static void PDILC_Update(void);
 static void ModelInverseILC_Update(void);
 static float ILC_CalculateRMS(void);
+static float ILC_CalculateRMS_SteadyState(void);
 static float ILC_MaxCorrection(void);
 
 /* USER CODE END PFP */
@@ -691,9 +693,10 @@ int main(void)
 					    StopActuators();
 
 					    float errorRMS = ILC_CalculateRMS();
+					    float errorRMS_SteadyState = ILC_CalculateRMS_SteadyState();
 
 					    PDILC_Update();
-//					    ModelInverseILC_Update();
+//					    ModelInverseILC_Update();  // Alternative learning law.
 
 					    float correctionPeak = ILC_MaxCorrection();
 
@@ -704,10 +707,14 @@ int main(void)
 					        (char*)UARTTXBuffer,
 					        UART_TX_BUFFER_SIZE - 1U,
 					        "Finished. X=%.4f mm, Y=%.4f mm, "
-					        "RMS_Y=%.6f mm, correction_peak=%.5f mm\r\n",
+					        "RMS_Y_full=%.6f mm, RMS_Y_samples_%u_to_%u=%.6f mm, "
+					        "correction_peak=%.5f mm\r\n",
 					        XActuator.MM.Position,
 					        YActuator.MM.Position,
 					        errorRMS,
+					        (unsigned int)ILC_RMS_START_SAMPLE,
+					        (unsigned int)ILC_TRIAL_SAMPLES,
+					        errorRMS_SteadyState,
 					        correctionPeak
 					    );
 
@@ -2121,6 +2128,27 @@ static float ILC_CalculateRMS(void)
 }
 
 
+/*
+ * RMS over the steady-state evaluation window only.
+ * ILC_RMS_START_SAMPLE is 1-based, so sample 1000 corresponds to C index 999.
+ * With 5000 trial samples, this evaluates samples 1000 through 5000 inclusive
+ * (4001 samples) and excludes the initial transient samples 1 through 999.
+ */
+static float ILC_CalculateRMS_SteadyState(void)
+{
+    float sum = 0.0f;
+    const uint32_t firstIndex = ILC_RMS_START_SAMPLE - 1U;
+    const uint32_t sampleCount = ILC_TRIAL_SAMPLES - firstIndex;
+
+    for (uint32_t k = firstIndex; k < ILC_TRIAL_SAMPLES; ++k) {
+        const float e = ilcErrorY[k];
+        sum += e * e;
+    }
+
+    return sqrtf(sum / (float)sampleCount);
+}
+
+
 static float ILC_MaxCorrection(void)
 {
     float peak = 0.0f;
@@ -2160,11 +2188,11 @@ static void PDILC_Update(void)
     /*
      * 1. Calculate the unfiltered PD-ILC update.
      *
-     * v_(j+1)[k] = u_j[k]
-     *            + gamma * (
-     *                Kp * e_j[k+1]
-     *                + Kd * (e_j[k+1] - e_j[k])
-     *              )
+     * u_(j+1)[k] = u_j[k]
+     *            + Kp * e_j[k+1]
+     *            + Kd * (e_j[k+1] - e_j[k])
+     *
+     * No beta/learning-scale multiplier is used in this PD update.
      */
     for (uint16_t k = 0U; k < ILC_TRIAL_SAMPLES; k++) {
 
@@ -2195,106 +2223,119 @@ static void PDILC_Update(void)
 
 
     /*
-     * 2. ORIGINAL FORWARD-BACKWARD FILTER IMPLEMENTATION
+     * 2A. CAUSAL Q-FILTER (ALTERNATIVE; COMMENTED OUT)
      *
-     * Disabled and retained for reference.
-     * The active implementation below uses only a causal
-     * forward pass.
+     * Keep this implementation for comparison. To return to the causal
+     * filter, comment out the active forward-backward block below and enable
+     * this block. This applies one pass from sample 0 to sample N-1 and
+     * therefore introduces the filter's phase delay.
      *
-     * float x1 = ilcCorrectionY[0];
-     * float x2 = x1;
-     * float y1 = x1;
-     * float y2 = x1;
+     * The zero initial states match MATLAB filter(b,a,x) with its default
+     * initial conditions. The candidate corrections are filtered in place,
+     * so no extra 5000-sample buffer is required.
      *
-     * // Forward pass.
-     * for (uint16_t k = 0U; k < ILC_TRIAL_SAMPLES; k++) {
+     * float x1 = 0.0f;
+     * float x2 = 0.0f;
+     * float y1 = 0.0f;
+     * float y2 = 0.0f;
      *
-     *     float x = ilcCorrectionY[k];
-     *
-     *     float y =
-     *         b0 * x + b1 * x1 + b2 * x2
-     *         - a1 * y1 - a2 * y2;
-     *
-     *     ilcCorrectionY[k] = y;
-     *
-     *     x2 = x1;
-     *     x1 = x;
-     *     y2 = y1;
-     *     y1 = y;
-     * }
-     *
-     * // Reverse pass.
-     * x1 = ilcCorrectionY[ILC_TRIAL_SAMPLES - 1U];
-     * x2 = x1;
-     * y1 = x1;
-     * y2 = x1;
-     *
-     * for (int32_t k = (int32_t)ILC_TRIAL_SAMPLES - 1;
-     *      k >= 0; k--) {
-     *
-     *     float x = ilcCorrectionY[k];
-     *
-     *     float y =
-     *         b0 * x + b1 * x1 + b2 * x2
-     *         - a1 * y1 - a2 * y2;
+     * for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k) {
+     *     const float x = ilcCorrectionY[k];
+     *     const float y =
+     *           b0 * x
+     *         + b1 * x1
+     *         + b2 * x2
+     *         - a1 * y1
+     *         - a2 * y2;
      *
      *     ilcCorrectionY[k] = y;
-     *
      *     x2 = x1;
      *     x1 = x;
      *     y2 = y1;
      *     y1 = y;
      * }
      */
-
 
     /*
-     * 3. CAUSAL Q-FILTER
+     * 2B. FORWARD-BACKWARD Q-FILTER (ACTIVE)
      *
-     * Apply one forward pass using the second-order
-     * Butterworth difference equation.
+     * Apply the same second-order Butterworth low-pass filter in the
+     * forward direction and then in the reverse direction. The reverse
+     * pass reduces the phase delay introduced by the forward pass.
      *
-     * Zero initial conditions, as in MATLAB filter(b,a,x).
+     * This is the lightweight in-place implementation intended for the
+     * STM32: it does not allocate another 5000-sample array and does not
+     * use MATLAB filtfilt(). Its endpoint handling is a simple steady-
+     * value initialization, so it approximates zero-phase filtering but
+     * is not identical to MATLAB filtfilt() at the boundaries.
      */
-    float x1 = 0.0f;
-    float x2 = 0.0f;
-    float y1 = 0.0f;
-    float y2 = 0.0f;
 
-    for (uint16_t k = 0U; k < ILC_TRIAL_SAMPLES; k++) {
+    /* Forward pass: initialize the filter states to the first sample
+     * to reduce the artificial startup transient at the beginning. */
+    float x1 = ilcCorrectionY[0];
+    float x2 = x1;
+    float y1 = x1;
+    float y2 = x1;
 
-        // Current unfiltered candidate.
-        float x = ilcCorrectionY[k];
+    for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k) {
 
-        // Causal IIR filter output.
-        float y =
-            b0 * x
+        // Current candidate before forward filtering.
+        const float x = ilcCorrectionY[k];
+
+        const float y =
+              b0 * x
             + b1 * x1
             + b2 * x2
             - a1 * y1
             - a2 * y2;
 
-        // Replace the candidate with its filtered value.
         ilcCorrectionY[k] = y;
 
         // Advance the input and output histories.
         x2 = x1;
         x1 = x;
+        y2 = y1;
+        y1 = y;
+    }
 
+    /* Reverse pass: initialize the states to the last forward-filtered
+     * sample and process the filtered profile from end to beginning. */
+    x1 = ilcCorrectionY[ILC_TRIAL_SAMPLES - 1U];
+    x2 = x1;
+    y1 = x1;
+    y2 = x1;
+
+    for (int32_t k = (int32_t)ILC_TRIAL_SAMPLES - 1; k >= 0; --k) {
+
+        // The current sample has not yet been overwritten by the reverse pass.
+        const float x = ilcCorrectionY[(uint32_t)k];
+
+        const float y =
+              b0 * x
+            + b1 * x1
+            + b2 * x2
+            - a1 * y1
+            - a2 * y2;
+
+        ilcCorrectionY[(uint32_t)k] = y;
+
+        // For reverse filtering, these histories advance toward lower indices.
+        x2 = x1;
+        x1 = x;
         y2 = y1;
         y1 = y;
     }
 
 
     /*
-     * 4. Preserve the existing endpoint constraints.
+     * 3. Preserve the existing endpoint constraints.
      */
     ilcCorrectionY[0] = 0.0f;
     ilcCorrectionY[ILC_TRIAL_SAMPLES - 1U] = 0.0f;
 
 
     /*
-     * 5. Preserve the existing correction limit.
+     * 4. Preserve the existing correction limit.
      */
     for (uint16_t k = 0U; k < ILC_TRIAL_SAMPLES; k++) {
 
