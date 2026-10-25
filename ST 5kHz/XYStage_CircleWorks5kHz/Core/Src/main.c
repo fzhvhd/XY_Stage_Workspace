@@ -2553,23 +2553,25 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
 //	HAL_GPIO_TogglePin(GPIOA,GPIO_PIN_9);
 
+	// Calculate the original reference once per sample.
+	float xReference = 0.0f;
+	float yReference = 0.0f;
+
 	// Generate the SINESTEP reference in the ISR.
 	if (ActiveCommand == SINESTEP_COMMAND) {
 
 	    if (LogCounter < SINESTEP_DURATION_SAMPLES) {
 
-	        uint16_t k = (uint16_t)LogCounter;
+		    const uint16_t k = (uint16_t)LogCounter;
 
-	        // The current test commands Y with a sine wave and keeps X nominally at zero.
-	        const float nominalX = 0.0f;
-	        const float nominalY =
-	            R_circle * sinf(freq_circle * ((float)k / SamplingFreq));
+		    xReference = R_circle * sinf(freq_circle * ((float)k / SamplingFreq));
+		    yReference = 0.0f;
 
-	        // Apply each axis's learned correction (stored in micrometres).
 	        const float commandedX =
-	            nominalX + ILC_MicrometresToMm(ilcCorrectionX_um[k]);
+	            xReference + ILC_MicrometresToMm(ilcCorrectionX_um[k]);
+
 	        const float commandedY =
-	            nominalY + ILC_MicrometresToMm(ilcCorrectionY_um[k]);
+	            yReference + ILC_MicrometresToMm(ilcCorrectionY_um[k]);
 
 	        SetControlParameters(
 	            1,
@@ -2612,10 +2614,6 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 			    LogCounter < ILC_TRIAL_SAMPLES) {
 
 			    const uint16_t k = (uint16_t)LogCounter;
-
-			    // Original Cartesian references, without ILC correction.
-			    const float xReference = R_circle * sinf(freq_circle * ((float)k / SamplingFreq));
-			    const float yReference = 0.0f;
 
 			    // Tracking error = reference - measured position.
 			    ilcErrorX_um[k] = ILC_MmToMicrometres(
