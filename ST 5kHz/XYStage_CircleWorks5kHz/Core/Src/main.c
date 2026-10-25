@@ -2439,17 +2439,68 @@ static void ModelInverseILC_Update(void)
     }
 
     /*
-     * Stage 2: Causal Q-filter.
+     * 2A. CAUSAL Q-FILTER (ALTERNATIVE; COMMENTED OUT)
+     *
+     * Retained for comparison. To use the causal filter again, enable
+     * this block and comment out the forward-backward block below.
+     *
+     * This applies one forward pass from sample 0 to sample N-1,
+     * introducing the phase delay of the low-pass filter.
      *
      * The correction array is filtered in place, so no additional
-     * 5000-sample buffer is needed.
+     * 5000-sample buffer is needed. Zero initial conditions match
+     * MATLAB filter(b,a,x).
      *
-     * Zero initial filter states, as with MATLAB filter(b,a,x).
+     * float x1 = 0.0f;
+     * float x2 = 0.0f;
+     * float y1 = 0.0f;
+     * float y2 = 0.0f;
+     *
+     * for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k)
+     * {
+     *     const float x = ilcCorrectionY[k];
+     *
+     *     const float y =
+     *           qB0 * x
+     *         + qB1 * x1
+     *         + qB2 * x2
+     *         - qA1 * y1
+     *         - qA2 * y2;
+     *
+     *     ilcCorrectionY[k] = y;
+     *
+     *     x2 = x1;
+     *     x1 = x;
+     *     y2 = y1;
+     *     y1 = y;
+     * }
      */
-    float x1 = 0.0f;
-    float x2 = 0.0f;
-    float y1 = 0.0f;
-    float y2 = 0.0f;
+
+
+    /*
+     * 2B. FORWARD-BACKWARD Q-FILTER (ACTIVE)
+     *
+     * Apply the same second-order Butterworth filter forward and then
+     * backward. The reverse pass reduces the phase delay introduced
+     * by the forward pass.
+     *
+     * This in-place implementation does not require another
+     * 5000-sample buffer and does not use MATLAB filtfilt().
+     *
+     * The boundary states are initialized to the first and last
+     * samples, respectively, to reduce boundary transients. This
+     * approximates zero-phase filtering but is not identical to
+     * MATLAB filtfilt() at the boundaries.
+     */
+
+    /*
+     * Forward pass: initialize the filter states to the first sample
+     * to reduce the artificial startup transient.
+     */
+    float x1 = ilcCorrectionY[0];
+    float x2 = x1;
+    float y1 = x1;
+    float y2 = x1;
 
     for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k)
     {
@@ -2462,28 +2513,67 @@ static void ModelInverseILC_Update(void)
             - qA1 * y1
             - qA2 * y2;
 
-        /* Preserve the filter's internal state before output limiting */
-        const float yState = y;
+        ilcCorrectionY[k] = y;
 
-        float filteredCorrection = y;
-
-        /* Hardware safeguard after Q-filtering */
-        if (filteredCorrection > correctionLimit)
-        {
-            filteredCorrection = correctionLimit;
-        }
-        else if (filteredCorrection < -correctionLimit)
-        {
-            filteredCorrection = -correctionLimit;
-        }
-
-        ilcCorrectionY[k] = filteredCorrection;
-
+        /* Advance the input and output histories */
         x2 = x1;
         x1 = x;
-
         y2 = y1;
-        y1 = yState;
+        y1 = y;
+    }
+
+    /*
+     * Reverse pass: initialize the states to the last forward-filtered
+     * sample and process the profile from end to beginning.
+     */
+    x1 = ilcCorrectionY[ILC_TRIAL_SAMPLES - 1U];
+    x2 = x1;
+    y1 = x1;
+    y2 = x1;
+
+    for (int32_t k = (int32_t)ILC_TRIAL_SAMPLES - 1;
+         k >= 0; --k)
+    {
+        /* This sample has not yet been overwritten by the reverse pass */
+        const float x = ilcCorrectionY[(uint32_t)k];
+
+        const float y =
+              qB0 * x
+            + qB1 * x1
+            + qB2 * x2
+            - qA1 * y1
+            - qA2 * y2;
+
+        ilcCorrectionY[(uint32_t)k] = y;
+
+        /* Advance histories toward lower sample indices */
+        x2 = x1;
+        x1 = x;
+        y2 = y1;
+        y1 = y;
+    }
+
+
+    /*
+     * 3. Preserve the hardware correction limit after filtering.
+     *
+     * Filtering can change the magnitude of the candidate correction,
+     * so clamp the final result as well.
+     */
+    for (uint16_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k)
+    {
+        float u = ilcCorrectionY[k];
+
+        if (u > correctionLimit)
+        {
+            u = correctionLimit;
+        }
+        else if (u < -correctionLimit)
+        {
+            u = -correctionLimit;
+        }
+
+        ilcCorrectionY[k] = u;
     }
 }
 
