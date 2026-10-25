@@ -193,10 +193,14 @@ typedef struct {
 #define ILC_USE_MODEL_INVERSE     0U    // 1: model inverse; 0: PD ILC, for both axes.
 #define ILC_MAX_CORRECTION_MM     2.0f
 #define MODEL_INVERSE_Q_FC_HZ     300.0f
-#define PDILC_Q_FC_HZ             500.0f
+#define PDILC_Q_FC_HZ             100.0f
 
-#define PDILC_KP                  0.5f
-#define PDILC_KD                 15.0f
+// Independent PD-ILC gains for each Cartesian axis. Tune X and Y separately.
+// The initial values preserve the previous gains; update them independently as needed.
+#define PDILC_KP_X                0.5f
+#define PDILC_KD_X               15.0f
+#define PDILC_KP_Y                0.1f
+#define PDILC_KD_Y               15.0f
 
 #define ILC_TRIAL_SAMPLES         5000U
 #define ILC_RMS_START_SAMPLE      1000U  // 1-based sample number; steady RMS includes samples 1000 through 5000.
@@ -364,7 +368,9 @@ void ReInitMechanicalController();
 static int16_t ILC_MmToMicrometres(float valueMm);
 static float ILC_MicrometresToMm(int16_t valueUm);
 static void PDILC_Update(void);
-static void PDILC_UpdateAxis(volatile int16_t *errorUm, volatile int16_t *correctionUm);
+static void PDILC_UpdateAxis(
+    volatile int16_t *errorUm, volatile int16_t *correctionUm,
+    float kp, float kd);
 static void ModelInverseILC_Update(void);
 static void ModelInverseILC_UpdateAxis(
     volatile int16_t *errorUm, volatile int16_t *correctionUm,
@@ -2221,8 +2227,8 @@ static float ILC_MaxCorrection(const volatile int16_t *correctionUm)
 /* Apply the selected PD-ILC learning law to both axes. */
 static void PDILC_Update(void)
 {
-    PDILC_UpdateAxis(ilcErrorX_um, ilcCorrectionX_um);
-//    PDILC_UpdateAxis(ilcErrorY_um, ilcCorrectionY_um);
+//    PDILC_UpdateAxis(ilcErrorX_um, ilcCorrectionX_um, PDILC_KP_X, PDILC_KD_X);
+//    PDILC_UpdateAxis(ilcErrorY_um, ilcCorrectionY_um, PDILC_KP_Y, PDILC_KD_Y);
 }
 
 
@@ -2234,7 +2240,9 @@ static void PDILC_Update(void)
  */
 static void PDILC_UpdateAxis(
     volatile int16_t *errorUm,
-    volatile int16_t *correctionUm)
+    volatile int16_t *correctionUm,
+    float kp,
+    float kd)
 {
     const float pi = 3.14159265358979323846f;
     const float sqrt2 = 1.41421356237f;
@@ -2263,7 +2271,7 @@ static void PDILC_UpdateAxis(
 
         const float e  = ILC_MicrometresToMm(errorUm[k]);
         const float en = ILC_MicrometresToMm(errorUm[kp1]);
-        const float delta = PDILC_KP * en + PDILC_KD * (en - e);
+        const float delta = kp * en + kd * (en - e);
 
         float nextU = ILC_MicrometresToMm(correctionUm[k]) + delta;
 
@@ -2380,14 +2388,14 @@ static void ModelInverseILC_Update(void)
     /* Identified X-axis closed-loop model coefficients, Fs = 5000 Hz. */
     ModelInverseILC_UpdateAxis(
         ilcErrorX_um, ilcCorrectionX_um,
-        0.004479489866204f, -0.004401416268165f,
-        -2.856542767600246f, 2.718847490405466f, -0.862229040316752f);
+        0.00447948986620422f, -0.00440141626816451f,
+        -2.85654276760025f, 2.71884749040547f, -0.862229040316752f);
 
     /* Identified Y-axis closed-loop model coefficients, Fs = 5000 Hz. */
     ModelInverseILC_UpdateAxis(
         ilcErrorY_um, ilcCorrectionY_um,
         0.00441711513541465f, -0.00437002549102584f,
-        -2.80924504797830f, 2.62331485857184f, -0.814023391722133f);
+        -2.8092450479783f, 2.62331485857184f, -0.814023391722133f);
 }
 
 
