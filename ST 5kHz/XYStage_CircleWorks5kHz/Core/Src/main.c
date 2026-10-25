@@ -189,7 +189,8 @@ typedef struct {
 //#define SINESTEP_SETTLE_SAMPLES    2500U  // 0.5 seconds at 5 kHz
 
 // ILC configuration
-#define ILC_BETA                  0.5f
+#define ILC_BETA                  0.5f  // Used by model-inverse ILC only.
+#define ILC_USE_MODEL_INVERSE     0U    // 1: model inverse; 0: PD ILC, for both axes.
 #define ILC_MAX_CORRECTION_MM     2.0f
 #define MODEL_INVERSE_Q_FC_HZ     300.0f
 #define PDILC_Q_FC_HZ             500.0f
@@ -255,9 +256,12 @@ volatile uint32_t PrintNumbers ;
 //float PosLog_U[2000];
 //float PosLog_V[2000];
 
-// Full-trial ILC buffers for the Y axis; shared by both update laws.
-static volatile float ilcErrorY[ILC_TRIAL_SAMPLES] = {0.0f};
-static volatile float ilcCorrectionY[ILC_TRIAL_SAMPLES] = {0.0f};
+// Full-trial ILC buffers for both axes. Values are stored in micrometres
+// (int16_t) to limit SRAM use; the ILC calculations remain in float.
+static volatile int16_t ilcErrorX_um[ILC_TRIAL_SAMPLES] = {0};
+static volatile int16_t ilcCorrectionX_um[ILC_TRIAL_SAMPLES] = {0};
+static volatile int16_t ilcErrorY_um[ILC_TRIAL_SAMPLES] = {0};
+static volatile int16_t ilcCorrectionY_um[ILC_TRIAL_SAMPLES] = {0};
 
 //uint32_t LogC[1000];
 //float EC_ConEffX_LOG[2000] ;
@@ -356,12 +360,18 @@ void EMeasurement();
 void LogData();
 void ReInitMechanicalController();
 
-//ILC
+// ILC conversion helpers, performance metrics, and update laws.
+static int16_t ILC_MmToMicrometres(float valueMm);
+static float ILC_MicrometresToMm(int16_t valueUm);
 static void PDILC_Update(void);
+static void PDILC_UpdateAxis(volatile int16_t *errorUm, volatile int16_t *correctionUm);
 static void ModelInverseILC_Update(void);
-static float ILC_CalculateRMS(void);
-static float ILC_CalculateRMS_SteadyState(void);
-static float ILC_MaxCorrection(void);
+static void ModelInverseILC_UpdateAxis(
+    volatile int16_t *errorUm, volatile int16_t *correctionUm,
+    float b1Plant, float b2Plant, float a1Plant, float a2Plant, float a3Plant);
+static float ILC_CalculateRMS(const volatile int16_t *errorUm);
+static float ILC_CalculateRMS_SteadyState(const volatile int16_t *errorUm);
+static float ILC_MaxCorrection(const volatile int16_t *correctionUm);
 
 /* USER CODE END PFP */
 
@@ -535,15 +545,19 @@ int main(void)
 
 		    HAL_UART_DMAStop(&huart2);
 
+		    // Columns: sample, X error [mm], X correction for next trial [mm],
+		    //          Y error [mm], Y correction for next trial [mm].
 		    for (uint32_t ii = 0U; ii < ILC_TRIAL_SAMPLES; ii++) {
 
 		        UARTTXLen = snprintf(
 		            (char*)UARTTXBuffer,
 		            UART_TX_BUFFER_SIZE - 1U,
-		            "%lu,%.6f,%.6f\r\n",
+		            "%lu,%.6f,%.6f,%.6f,%.6f\r\n",
 		            (unsigned long)ii,
-		            (double)ilcErrorY[ii],
-		            (double)ilcCorrectionY[ii]
+		            (double)ILC_MicrometresToMm(ilcErrorX_um[ii]),
+		            (double)ILC_MicrometresToMm(ilcCorrectionX_um[ii]),
+		            (double)ILC_MicrometresToMm(ilcErrorY_um[ii]),
+		            (double)ILC_MicrometresToMm(ilcCorrectionY_um[ii])
 		        );
 
 		        HAL_UART_Transmit(
@@ -692,13 +706,21 @@ int main(void)
 
 					    StopActuators();
 
-					    float errorRMS = ILC_CalculateRMS();
-					    float errorRMS_SteadyState = ILC_CalculateRMS_SteadyState();
+					    // Evaluate the current trial before updating the corrections.
+					    float errorRMS_X = ILC_CalculateRMS(ilcErrorX_um);
+					    float errorRMS_Y = ILC_CalculateRMS(ilcErrorY_um);
+					    float errorRMS_X_SteadyState = ILC_CalculateRMS_SteadyState(ilcErrorX_um);
+					    float errorRMS_Y_SteadyState = ILC_CalculateRMS_SteadyState(ilcErrorY_um);
 
-					    PDILC_Update();
-//					    ModelInverseILC_Update();  // Alternative learning law.
+#if ILC_USE_MODEL_INVERSE
+					    ModelInverseILC_Update();  // Model-inverse ILC updates X and Y.
+#else
+					    PDILC_Update();            // PD ILC updates X and Y; no beta multiplier.
+#endif
 
-					    float correctionPeak = ILC_MaxCorrection();
+					    // These peaks describe the corrections to be used in the next trial.
+					    float correctionPeakX = ILC_MaxCorrection(ilcCorrectionX_um);
+					    float correctionPeakY = ILC_MaxCorrection(ilcCorrectionY_um);
 
 					    ActiveCommand = IDLE_COMMAND;
 					    STPOS = 0;
@@ -707,15 +729,22 @@ int main(void)
 					        (char*)UARTTXBuffer,
 					        UART_TX_BUFFER_SIZE - 1U,
 					        "Finished. X=%.4f mm, Y=%.4f mm, "
-					        "RMS_Y_full=%.6f mm, RMS_Y_samples_%u_to_%u=%.6f mm, "
-					        "correction_peak=%.5f mm\r\n",
+					        "RMS_X_full=%.6f mm, RMS_Y_full=%.6f mm, "
+					        "RMS_X_samples_%u_to_%u=%.6f mm, "
+					        "RMS_Y_samples_%u_to_%u=%.6f mm, "
+					        "correction_peak_X_next=%.5f mm, correction_peak_Y_next=%.5f mm\r\n",
 					        XActuator.MM.Position,
 					        YActuator.MM.Position,
-					        errorRMS,
+					        errorRMS_X,
+					        errorRMS_Y,
 					        (unsigned int)ILC_RMS_START_SAMPLE,
 					        (unsigned int)ILC_TRIAL_SAMPLES,
-					        errorRMS_SteadyState,
-					        correctionPeak
+					        errorRMS_X_SteadyState,
+					        (unsigned int)ILC_RMS_START_SAMPLE,
+					        (unsigned int)ILC_TRIAL_SAMPLES,
+					        errorRMS_Y_SteadyState,
+					        correctionPeakX,
+					        correctionPeakY
 					    );
 
 					    HAL_UART_Transmit(
@@ -2114,13 +2143,38 @@ void LogData() {
 
 }
 
-//ILC
-static float ILC_CalculateRMS(void)
+// ILC conversion helpers: data arrays use micrometres to reduce SRAM usage.
+static int16_t ILC_MmToMicrometres(float valueMm)
+{
+    const float valueUm = valueMm * 1000.0f;
+
+    // Saturate before conversion so out-of-range values cannot overflow int16_t.
+    if (valueUm >= 32767.0f) {
+        return (int16_t)32767;
+    }
+    if (valueUm <= -32768.0f) {
+        return (int16_t)(-32767 - 1);
+    }
+
+    // Round to the nearest micrometre rather than truncating toward zero.
+    if (valueUm >= 0.0f) {
+        return (int16_t)(valueUm + 0.5f);
+    }
+    return (int16_t)(valueUm - 0.5f);
+}
+
+static float ILC_MicrometresToMm(int16_t valueUm)
+{
+    return (float)valueUm * 0.001f;
+}
+
+
+static float ILC_CalculateRMS(const volatile int16_t *errorUm)
 {
     float sum = 0.0f;
 
-    for (uint16_t k = 0U; k < ILC_TRIAL_SAMPLES; k++) {
-        float e = ilcErrorY[k];
+    for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k) {
+        const float e = ILC_MicrometresToMm(errorUm[k]);
         sum += e * e;
     }
 
@@ -2134,14 +2188,14 @@ static float ILC_CalculateRMS(void)
  * With 5000 trial samples, this evaluates samples 1000 through 5000 inclusive
  * (4001 samples) and excludes the initial transient samples 1 through 999.
  */
-static float ILC_CalculateRMS_SteadyState(void)
+static float ILC_CalculateRMS_SteadyState(const volatile int16_t *errorUm)
 {
     float sum = 0.0f;
     const uint32_t firstIndex = ILC_RMS_START_SAMPLE - 1U;
     const uint32_t sampleCount = ILC_TRIAL_SAMPLES - firstIndex;
 
     for (uint32_t k = firstIndex; k < ILC_TRIAL_SAMPLES; ++k) {
-        const float e = ilcErrorY[k];
+        const float e = ILC_MicrometresToMm(errorUm[k]);
         sum += e * e;
     }
 
@@ -2149,13 +2203,12 @@ static float ILC_CalculateRMS_SteadyState(void)
 }
 
 
-static float ILC_MaxCorrection(void)
+static float ILC_MaxCorrection(const volatile int16_t *correctionUm)
 {
     float peak = 0.0f;
 
-    for (uint16_t k = 0U; k < ILC_TRIAL_SAMPLES; k++) {
-        float u = fabsf(ilcCorrectionY[k]);
-
+    for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k) {
+        const float u = fabsf(ILC_MicrometresToMm(correctionUm[k]));
         if (u > peak) {
             peak = u;
         }
@@ -2164,26 +2217,36 @@ static float ILC_MaxCorrection(void)
     return peak;
 }
 
+
+/* Apply the selected PD-ILC learning law to both axes. */
 static void PDILC_Update(void)
 {
-    const float pi = 3.14159265358979323846f;
+    PDILC_UpdateAxis(ilcErrorX_um, ilcCorrectionX_um);
+//    PDILC_UpdateAxis(ilcErrorY_um, ilcCorrectionY_um);
+}
 
-    const float K = tanf(pi * PDILC_Q_FC_HZ / SamplingFreq);
+
+/*
+ * PD-ILC update for one axis.
+ * No beta/learning-scale multiplier is used in this PD update.
+ * Forward-backward Q filtering is active; the causal alternative is kept
+ * commented below so it can be restored for comparison.
+ */
+static void PDILC_UpdateAxis(
+    volatile int16_t *errorUm,
+    volatile int16_t *correctionUm)
+{
+    const float pi = 3.14159265358979323846f;
     const float sqrt2 = 1.41421356237f;
 
-    const float norm =
-        1.0f / (1.0f + sqrt2 * K + K * K);
+    const float K = tanf(pi * PDILC_Q_FC_HZ / SamplingFreq);
+    const float norm = 1.0f / (1.0f + sqrt2 * K + K * K);
 
     const float b0 = K * K * norm;
     const float b1 = 2.0f * b0;
     const float b2 = b0;
-
-    const float a1 =
-        2.0f * (K * K - 1.0f) * norm;
-
-    const float a2 =
-        (1.0f - sqrt2 * K + K * K) * norm;
-
+    const float a1 = 2.0f * (K * K - 1.0f) * norm;
+    const float a2 = (1.0f - sqrt2 * K + K * K) * norm;
 
     /*
      * 1. Calculate the unfiltered PD-ILC update.
@@ -2192,47 +2255,36 @@ static void PDILC_Update(void)
      *            + Kp * e_j[k+1]
      *            + Kd * (e_j[k+1] - e_j[k])
      *
-     * No beta/learning-scale multiplier is used in this PD update.
+     * The final sample uses e[k+1] = e[k] to avoid indexing beyond the trial.
      */
-    for (uint16_t k = 0U; k < ILC_TRIAL_SAMPLES; k++) {
-
-        uint16_t kp1 =
+    for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k) {
+        const uint32_t kp1 =
             (k < ILC_TRIAL_SAMPLES - 1U) ? (k + 1U) : k;
 
-        float e  = ilcErrorY[k];
-        float en = ilcErrorY[kp1];
+        const float e  = ILC_MicrometresToMm(errorUm[k]);
+        const float en = ILC_MicrometresToMm(errorUm[kp1]);
+        const float delta = PDILC_KP * en + PDILC_KD * (en - e);
 
-        float delta =
-            PDILC_KP * en
-            + PDILC_KD * (en - e);
+        float nextU = ILC_MicrometresToMm(correctionUm[k]) + delta;
 
-        float nextU =
-            ilcCorrectionY[k]
-            + delta;
-
-        // Preserve the existing correction limit.
+        // Preserve the existing correction limit before Q filtering.
         if (nextU > ILC_MAX_CORRECTION_MM) {
             nextU = ILC_MAX_CORRECTION_MM;
         } else if (nextU < -ILC_MAX_CORRECTION_MM) {
             nextU = -ILC_MAX_CORRECTION_MM;
         }
 
-        // Store the unfiltered candidate temporarily.
-        ilcCorrectionY[k] = nextU;
+        // Store the unfiltered candidate temporarily (1 um resolution).
+        correctionUm[k] = ILC_MmToMicrometres(nextU);
     }
-
 
     /*
      * 2A. CAUSAL Q-FILTER (ALTERNATIVE; COMMENTED OUT)
      *
-     * Keep this implementation for comparison. To return to the causal
-     * filter, comment out the active forward-backward block below and enable
-     * this block. This applies one pass from sample 0 to sample N-1 and
-     * therefore introduces the filter's phase delay.
-     *
-     * The zero initial states match MATLAB filter(b,a,x) with its default
-     * initial conditions. The candidate corrections are filtered in place,
-     * so no extra 5000-sample buffer is required.
+     * To use the causal filter, enable this block and disable the active
+     * forward-backward block below. Zero initial states match MATLAB
+     * filter(b,a,x). The array is filtered in place; no extra trial buffer
+     * is required.
      *
      * float x1 = 0.0f;
      * float x2 = 0.0f;
@@ -2240,106 +2292,76 @@ static void PDILC_Update(void)
      * float y2 = 0.0f;
      *
      * for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k) {
-     *     const float x = ilcCorrectionY[k];
-     *     const float y =
-     *           b0 * x
-     *         + b1 * x1
-     *         + b2 * x2
-     *         - a1 * y1
-     *         - a2 * y2;
-     *
-     *     ilcCorrectionY[k] = y;
-     *     x2 = x1;
-     *     x1 = x;
-     *     y2 = y1;
-     *     y1 = y;
+     *     const float x = ILC_MicrometresToMm(correctionUm[k]);
+     *     const float y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2;
+     *     correctionUm[k] = ILC_MmToMicrometres(y);
+     *     x2 = x1; x1 = x;
+     *     y2 = y1; y1 = y;
      * }
      */
 
     /*
      * 2B. FORWARD-BACKWARD Q-FILTER (ACTIVE)
      *
-     * Apply the same second-order Butterworth low-pass filter in the
-     * forward direction and then in the reverse direction. The reverse
-     * pass reduces the phase delay introduced by the forward pass.
-     *
-     * This is the lightweight in-place implementation intended for the
-     * STM32: it does not allocate another 5000-sample array and does not
-     * use MATLAB filtfilt(). Its endpoint handling is a simple steady-
-     * value initialization, so it approximates zero-phase filtering but
-     * is not identical to MATLAB filtfilt() at the boundaries.
+     * Filter forward and then backward with the same second-order Butterworth
+     * low-pass filter. This reduces the phase delay of the forward pass.
+     * This lightweight in-place implementation does not use MATLAB filtfilt()
+     * and does not allocate another 5000-sample buffer. The boundary states
+     * are initialized to the first/last sample (steady-value initialization).
      */
 
-    /* Forward pass: initialize the filter states to the first sample
-     * to reduce the artificial startup transient at the beginning. */
-    float x1 = ilcCorrectionY[0];
+    // Forward pass: steady-value initialization at the first sample.
+    float x1 = ILC_MicrometresToMm(correctionUm[0]);
     float x2 = x1;
     float y1 = x1;
     float y2 = x1;
 
     for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k) {
+        const float x = ILC_MicrometresToMm(correctionUm[k]);
+        const float y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2;
 
-        // Current candidate before forward filtering.
-        const float x = ilcCorrectionY[k];
+        correctionUm[k] = ILC_MmToMicrometres(y);
 
-        const float y =
-              b0 * x
-            + b1 * x1
-            + b2 * x2
-            - a1 * y1
-            - a2 * y2;
-
-        ilcCorrectionY[k] = y;
-
-        // Advance the input and output histories.
+        // Advance input/output histories using the unquantized filter state.
         x2 = x1;
         x1 = x;
         y2 = y1;
         y1 = y;
     }
 
-    /* Reverse pass: initialize the states to the last forward-filtered
-     * sample and process the filtered profile from end to beginning. */
-    x1 = ilcCorrectionY[ILC_TRIAL_SAMPLES - 1U];
+    // Reverse pass: initialize histories from the final forward-filtered sample.
+    x1 = ILC_MicrometresToMm(correctionUm[ILC_TRIAL_SAMPLES - 1U]);
     x2 = x1;
     y1 = x1;
     y2 = x1;
 
     for (int32_t k = (int32_t)ILC_TRIAL_SAMPLES - 1; k >= 0; --k) {
+        const uint32_t index = (uint32_t)k;
+        const float x = ILC_MicrometresToMm(correctionUm[index]);
+        const float y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2;
 
-        // The current sample has not yet been overwritten by the reverse pass.
-        const float x = ilcCorrectionY[(uint32_t)k];
+        correctionUm[index] = ILC_MmToMicrometres(y);
 
-        const float y =
-              b0 * x
-            + b1 * x1
-            + b2 * x2
-            - a1 * y1
-            - a2 * y2;
-
-        ilcCorrectionY[(uint32_t)k] = y;
-
-        // For reverse filtering, these histories advance toward lower indices.
+        // Reverse histories move toward lower sample indices.
         x2 = x1;
         x1 = x;
         y2 = y1;
         y1 = y;
     }
 
-
     /*
      * 3. Preserve the existing endpoint constraints.
      */
-    ilcCorrectionY[0] = 0.0f;
-    ilcCorrectionY[ILC_TRIAL_SAMPLES - 1U] = 0.0f;
-
+    correctionUm[0] = 0;
+    correctionUm[ILC_TRIAL_SAMPLES - 1U] = 0;
 
     /*
-     * 4. Preserve the existing correction limit.
+     * 4. Preserve the existing correction limit after filtering.
+     * Filtering can change the magnitude of the candidate correction, so
+     * clamp the final profile again before it is used on the next trial.
      */
-    for (uint16_t k = 0U; k < ILC_TRIAL_SAMPLES; k++) {
-
-        float u = ilcCorrectionY[k];
+    for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k) {
+        float u = ILC_MicrometresToMm(correctionUm[k]);
 
         if (u > ILC_MAX_CORRECTION_MM) {
             u = ILC_MAX_CORRECTION_MM;
@@ -2347,29 +2369,47 @@ static void PDILC_Update(void)
             u = -ILC_MAX_CORRECTION_MM;
         }
 
-        ilcCorrectionY[k] = u;
+        correctionUm[k] = ILC_MmToMicrometres(u);
     }
 }
 
 
+/* Apply the selected model-inverse learning law to both axes. */
 static void ModelInverseILC_Update(void)
 {
-    /* Identified Y-axis closed-loop model coefficients, Fs = 5000 Hz */
-    const float b1Plant =  0.00441711513541465f;
-    const float b2Plant = -0.00437002549102584f;
+    /* Identified X-axis closed-loop model coefficients, Fs = 5000 Hz. */
+    ModelInverseILC_UpdateAxis(
+        ilcErrorX_um, ilcCorrectionX_um,
+        0.004479489866204f, -0.004401416268165f,
+        -2.856542767600246f, 2.718847490405466f, -0.862229040316752f);
 
-    const float a1Plant = -2.80924504797830f;
-    const float a2Plant =  2.62331485857184f;
-    const float a3Plant = -0.814023391722133f;
+    /* Identified Y-axis closed-loop model coefficients, Fs = 5000 Hz. */
+    ModelInverseILC_UpdateAxis(
+        ilcErrorY_um, ilcCorrectionY_um,
+        0.00441711513541465f, -0.00437002549102584f,
+        -2.80924504797830f, 2.62331485857184f, -0.814023391722133f);
+}
 
+
+/*
+ * Model-inverse ILC update for one axis. Each axis has an independent error
+ * profile, correction profile, and identified closed-loop model. ILC_BETA is
+ * used by model-inverse ILC only; PD ILC does not use this gain.
+ */
+static void ModelInverseILC_UpdateAxis(
+    volatile int16_t *errorUm,
+    volatile int16_t *correctionUm,
+    float b1Plant,
+    float b2Plant,
+    float a1Plant,
+    float a2Plant,
+    float a3Plant)
+{
     const float pi = 3.14159265358979323846f;
     const float sqrt2 = 1.4142135623730951f;
     const float correctionLimit = ILC_MAX_CORRECTION_MM;
 
-    /*
-     * Design a second-order Butterworth low-pass filter.
-     * The cutoff is configured by MODEL_INVERSE_Q_FC_HZ above.
-     */
+    /* Design the second-order Butterworth low-pass Q-filter. */
     const float K = tanf(pi * MODEL_INVERSE_Q_FC_HZ / SamplingFreq);
     const float K2 = K * K;
     const float qDen = 1.0f + sqrt2 * K + K2;
@@ -2377,203 +2417,135 @@ static void ModelInverseILC_Update(void)
     const float qB0 = K2 / qDen;
     const float qB1 = 2.0f * K2 / qDen;
     const float qB2 = K2 / qDen;
-
     const float qA1 = 2.0f * (K2 - 1.0f) / qDen;
     const float qA2 = (1.0f - sqrt2 * K + K2) / qDen;
 
     /*
-     * Stage 1: Apply the inverse model to the recorded error.
+     * 1. Apply the inverse model to the recorded tracking error.
      *
      * L*e[k] =
      * (e[k+1] + a1*e[k] + a2*e[k-1] + a3*e[k-2]
      *  - b2*L*e[k-1]) / b1
      *
      * Boundary convention matches the standalone MATLAB code:
-     * e[k-1] and e[k-2] initially use e[0].
-     * At the last sample, e[k+1] uses e[last].
-     *
-     * Update the existing correction:
-     * u_next = u_previous + beta*(L*e)
+     * e[k-1] and e[k-2] initially use e[0]. At the last sample, e[k+1]
+     * uses e[last]. Update: u_next = u_previous + ILC_BETA*(L*e).
      */
-    float eMinus1 = ilcErrorY[0];
-    float eMinus2 = ilcErrorY[0];
+    float eMinus1 = ILC_MicrometresToMm(errorUm[0]);
+    float eMinus2 = eMinus1;
     float inversePrevious = 0.0f;
 
-    for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k)
-    {
-        const float eNow = ilcErrorY[k];
-
-        const float eNext =
-            (k < (ILC_TRIAL_SAMPLES - 1U))
-            ? ilcErrorY[k + 1U]
-            : ilcErrorY[k];
+    for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k) {
+        const float eNow = ILC_MicrometresToMm(errorUm[k]);
+        const float eNext = ILC_MicrometresToMm(
+            (k < ILC_TRIAL_SAMPLES - 1U) ? errorUm[k + 1U] : errorUm[k]);
 
         const float inverseCorrection =
-            (eNext
-             + a1Plant * eNow
-             + a2Plant * eMinus1
-             + a3Plant * eMinus2
-             - b2Plant * inversePrevious) / b1Plant;
+            (eNext + a1Plant * eNow + a2Plant * eMinus1
+             + a3Plant * eMinus2 - b2Plant * inversePrevious) / b1Plant;
 
         float nextCorrection =
-            ilcCorrectionY[k] + ILC_BETA * inverseCorrection;
+            ILC_MicrometresToMm(correctionUm[k])
+            + ILC_BETA * inverseCorrection;
 
-        /* Hardware safeguard before Q-filtering */
-        if (nextCorrection > correctionLimit)
-        {
+        // Hardware safeguard before Q-filtering.
+        if (nextCorrection > correctionLimit) {
             nextCorrection = correctionLimit;
-        }
-        else if (nextCorrection < -correctionLimit)
-        {
+        } else if (nextCorrection < -correctionLimit) {
             nextCorrection = -correctionLimit;
         }
 
-        ilcCorrectionY[k] = nextCorrection;
+        correctionUm[k] = ILC_MmToMicrometres(nextCorrection);
 
-        /* Update previous-error history */
+        // Update previous-error and inverse-model histories.
         eMinus2 = eMinus1;
         eMinus1 = eNow;
-
-        /* Update inverse-model history */
         inversePrevious = inverseCorrection;
     }
 
     /*
-     * 2A. CAUSAL Q-FILTER (ALTERNATIVE; COMMENTED OUT)
+     * Stage 2A: CAUSAL Q-FILTER (ALTERNATIVE; COMMENTED OUT).
      *
-     * Retained for comparison. To use the causal filter again, enable
-     * this block and comment out the forward-backward block below.
+     * Enable this block and disable the forward-backward block to return to
+     * a causal Q-filter. This applies one forward pass from sample 0 to
+     * sample N-1 and therefore introduces the filter's phase delay.
      *
-     * This applies one forward pass from sample 0 to sample N-1,
-     * introducing the phase delay of the low-pass filter.
+     * The correction array is filtered in place, so no additional 5000-sample
+     * buffer is needed. Zero initial filter states match MATLAB filter(b,a,x).
      *
-     * The correction array is filtered in place, so no additional
-     * 5000-sample buffer is needed. Zero initial conditions match
-     * MATLAB filter(b,a,x).
-     *
-     * float x1 = 0.0f;
-     * float x2 = 0.0f;
-     * float y1 = 0.0f;
-     * float y2 = 0.0f;
-     *
-     * for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k)
-     * {
-     *     const float x = ilcCorrectionY[k];
-     *
-     *     const float y =
-     *           qB0 * x
-     *         + qB1 * x1
-     *         + qB2 * x2
-     *         - qA1 * y1
-     *         - qA2 * y2;
-     *
-     *     ilcCorrectionY[k] = y;
-     *
-     *     x2 = x1;
-     *     x1 = x;
-     *     y2 = y1;
-     *     y1 = y;
+     * float x1 = 0.0f, x2 = 0.0f, y1 = 0.0f, y2 = 0.0f;
+     * for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k) {
+     *     const float x = ILC_MicrometresToMm(correctionUm[k]);
+     *     const float y = qB0*x + qB1*x1 + qB2*x2 - qA1*y1 - qA2*y2;
+     *     correctionUm[k] = ILC_MmToMicrometres(y);
+     *     x2 = x1; x1 = x; y2 = y1; y1 = y;
      * }
      */
 
-
     /*
-     * 2B. FORWARD-BACKWARD Q-FILTER (ACTIVE)
+     * Stage 2B: FORWARD-BACKWARD Q-FILTER (ACTIVE).
      *
-     * Apply the same second-order Butterworth filter forward and then
-     * backward. The reverse pass reduces the phase delay introduced
-     * by the forward pass.
+     * Apply the same second-order Butterworth Q-filter forward and then
+     * backward. The reverse pass reduces the phase delay introduced by the
+     * forward pass, approximating zero-phase filtering.
      *
-     * This in-place implementation does not require another
-     * 5000-sample buffer and does not use MATLAB filtfilt().
-     *
-     * The boundary states are initialized to the first and last
-     * samples, respectively, to reduce boundary transients. This
-     * approximates zero-phase filtering but is not identical to
-     * MATLAB filtfilt() at the boundaries.
+     * This lightweight in-place implementation requires no additional
+     * 5000-sample buffer and does not call MATLAB filtfilt(). It uses simple
+     * steady-value initialization at the beginning and end of the profile,
+     * so its boundary handling is not identical to MATLAB filtfilt().
      */
 
-    /*
-     * Forward pass: initialize the filter states to the first sample
-     * to reduce the artificial startup transient.
-     */
-    float x1 = ilcCorrectionY[0];
+    // Forward pass: steady-value initialization at the first sample.
+    float x1 = ILC_MicrometresToMm(correctionUm[0]);
     float x2 = x1;
     float y1 = x1;
     float y2 = x1;
 
-    for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k)
-    {
-        const float x = ilcCorrectionY[k];
+    for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k) {
+        const float x = ILC_MicrometresToMm(correctionUm[k]);
+        const float y = qB0*x + qB1*x1 + qB2*x2 - qA1*y1 - qA2*y2;
 
-        const float y =
-              qB0 * x
-            + qB1 * x1
-            + qB2 * x2
-            - qA1 * y1
-            - qA2 * y2;
+        correctionUm[k] = ILC_MmToMicrometres(y);
 
-        ilcCorrectionY[k] = y;
-
-        /* Advance the input and output histories */
         x2 = x1;
         x1 = x;
         y2 = y1;
         y1 = y;
     }
 
-    /*
-     * Reverse pass: initialize the states to the last forward-filtered
-     * sample and process the profile from end to beginning.
-     */
-    x1 = ilcCorrectionY[ILC_TRIAL_SAMPLES - 1U];
+    // Reverse pass: steady-value initialization at the last filtered sample.
+    x1 = ILC_MicrometresToMm(correctionUm[ILC_TRIAL_SAMPLES - 1U]);
     x2 = x1;
     y1 = x1;
     y2 = x1;
 
-    for (int32_t k = (int32_t)ILC_TRIAL_SAMPLES - 1;
-         k >= 0; --k)
-    {
-        /* This sample has not yet been overwritten by the reverse pass */
-        const float x = ilcCorrectionY[(uint32_t)k];
+    for (int32_t k = (int32_t)ILC_TRIAL_SAMPLES - 1; k >= 0; --k) {
+        const uint32_t index = (uint32_t)k;
+        const float x = ILC_MicrometresToMm(correctionUm[index]);
+        const float y = qB0*x + qB1*x1 + qB2*x2 - qA1*y1 - qA2*y2;
 
-        const float y =
-              qB0 * x
-            + qB1 * x1
-            + qB2 * x2
-            - qA1 * y1
-            - qA2 * y2;
+        correctionUm[index] = ILC_MmToMicrometres(y);
 
-        ilcCorrectionY[(uint32_t)k] = y;
-
-        /* Advance histories toward lower sample indices */
         x2 = x1;
         x1 = x;
         y2 = y1;
         y1 = y;
     }
 
+    /* 3. Preserve endpoint constraints and re-apply the correction limit. */
+    correctionUm[0] = 0;
+    correctionUm[ILC_TRIAL_SAMPLES - 1U] = 0;
 
-    /*
-     * 3. Preserve the hardware correction limit after filtering.
-     *
-     * Filtering can change the magnitude of the candidate correction,
-     * so clamp the final result as well.
-     */
-    for (uint16_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k)
-    {
-        float u = ilcCorrectionY[k];
+    for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k) {
+        float u = ILC_MicrometresToMm(correctionUm[k]);
 
-        if (u > correctionLimit)
-        {
+        if (u > correctionLimit) {
             u = correctionLimit;
-        }
-        else if (u < -correctionLimit)
-        {
+        } else if (u < -correctionLimit) {
             u = -correctionLimit;
         }
 
-        ilcCorrectionY[k] = u;
+        correctionUm[k] = ILC_MmToMicrometres(u);
     }
 }
 
@@ -2588,20 +2560,21 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
 	        uint16_t k = (uint16_t)LogCounter;
 
-	        // Original reference.
-	        float nominalY =
-	            R_circle * sinf(
-	                freq_circle * ((float)k / SamplingFreq)
-	            );
+	        // The current test commands Y with a sine wave and keeps X nominally at zero.
+	        const float nominalX = 0.0f;
+	        const float nominalY =
+	            R_circle * sinf(freq_circle * ((float)k / SamplingFreq));
 
-	        // Apply the learned correction.
-	        float commandedY =
-	            nominalY + ilcCorrectionY[k];
+	        // Apply each axis's learned correction (stored in micrometres).
+	        const float commandedX =
+	            nominalX + ILC_MicrometresToMm(ilcCorrectionX_um[k]);
+	        const float commandedY =
+	            nominalY + ILC_MicrometresToMm(ilcCorrectionY_um[k]);
 
 	        SetControlParameters(
 	            1,
 	            POSITION_CONTROL,
-	            0.0f,
+	            commandedX,
 	            commandedY,
 	            DONT_CHANGE_IT,
 	            0.0f,
@@ -2633,22 +2606,22 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
 			MMeasurement();
 
-			// Record the full 1-second Y tracking-error profile.
-			// LogCounter is the sample index at 5 kHz.
+			// Record both 1-second Cartesian tracking-error profiles.
+			// LogCounter is the sample index at 5 kHz. Store error in micrometres.
 			if (ActiveCommand == SINESTEP_COMMAND &&
 			    LogCounter < ILC_TRIAL_SAMPLES) {
 
-			    uint16_t k = (uint16_t)LogCounter;
+			    const uint16_t k = (uint16_t)LogCounter;
 
-			    // Original Cartesian Y reference, without ILC correction.
-			    float yReference =
-			        R_circle * sinf(
-			            freq_circle * ((float)k / SamplingFreq)
-			        );
+			    // Original Cartesian references, without ILC correction.
+			    const float xReference = R_circle * sinf(freq_circle * ((float)k / SamplingFreq));
+			    const float yReference = 0.0f;
 
-			    // Tracking error in mm: desired position minus measured position.
-			    ilcErrorY[k] =
-			        yReference - YActuator.MM.Position;
+			    // Tracking error = reference - measured position.
+			    ilcErrorX_um[k] = ILC_MmToMicrometres(
+			        xReference - XActuator.MM.Position);
+			    ilcErrorY_um[k] = ILC_MmToMicrometres(
+			        yReference - YActuator.MM.Position);
 			}
 
 
