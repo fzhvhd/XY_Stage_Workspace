@@ -193,9 +193,9 @@ typedef struct {
 
 // ILC configuration
 #define ILC_BETA                  0.5f  // Used by model-inverse ILC only.
-#define ILC_USE_MODEL_INVERSE     0U    // 1: model inverse; 0: PD ILC, for both axes.
+#define ILC_USE_MODEL_INVERSE     1U    // 1: model inverse; 0: PD ILC, for both axes.
 #define ILC_MAX_CORRECTION_MM     2.0f
-#define MODEL_INVERSE_Q_FC_HZ     300.0f
+#define MODEL_INVERSE_Q_FC_HZ     50.0f
 #define PDILC_Q_FC_HZ             50.0f
 
 // Independent PD-ILC gains for each Cartesian axis. Tune X and Y separately.
