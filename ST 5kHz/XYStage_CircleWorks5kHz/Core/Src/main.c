@@ -140,11 +140,13 @@ typedef struct {
 #define CIRCLE_COMMAND						18
 #define SQUARE_COMMAND					    19
 #define TRIANGLE_COMMAND				    20
-#define SINESTEP_COMMAND				    21
+#define SINX_COMMAND                    21
+#define SINESTEP_COMMAND                SINX_COMMAND  // Legacy internal alias
 #define PRINT_COMMAND						22
 #define PETAL_COMMAND						23
 #define EPITROCHOID_COMMAND					24
 #define CURRENT_PRINT_COMMAND				25  // Temporary X/Y current log output
+#define SINY_COMMAND                    26
 
 ////////////////////////////////////////////////////////////////////////////////
 /* Control Mode --------------------------------------------------------------*/
@@ -554,8 +556,10 @@ case PRINT_COMMAND: {
 		    // The command identifies which reference MATLAB should reconstruct.
 		    const char *profileName = "UNKNOWN";
 		    float profileRampSeconds = 0.0f;
-		    if (ILC_ActiveProfileCommand == SINESTEP_COMMAND) {
-		        profileName = "SIST";
+		    if (ILC_ActiveProfileCommand == SINX_COMMAND) {
+		        profileName = "SINX";
+		    } else if (ILC_ActiveProfileCommand == SINY_COMMAND) {
+		        profileName = "SINY";
 		    } else if (ILC_ActiveProfileCommand == CIRCLE_COMMAND) {
 		        profileName = "CIRC";
 		        profileRampSeconds = CIRCLE_RAMP_DURATION_S;
@@ -737,16 +741,21 @@ case PRINT_COMMAND: {
 			}
 			break;
 
-		case SINESTEP_COMMAND:
+		case SINX_COMMAND:
+		case SINY_COMMAND:
 
 					if (LogCounter == 0 && STPOS == 0) {
-                        if (ILC_ActiveProfileCommand != SINESTEP_COMMAND) {
+                        if (ILC_ActiveProfileCommand != ActiveCommand) {
+                            // This baseline keeps one shared correction profile.
+                            // Repeating the same command learns from its previous trial;
+                            // switching between SINX, SINY, and CIRC starts with zero correction.
                             ILC_ResetCorrections();
-                            ILC_ActiveProfileCommand = SINESTEP_COMMAND;
+                            ILC_ActiveProfileCommand = ActiveCommand;
                         }
 						HAL_UART_DMAStop(&huart2);
-						UARTTXLen = sprintf((char*) UARTTXBuffer,
-								"COMMAND=SIST\r\n");
+						UARTTXLen = snprintf((char*)UARTTXBuffer,
+                            UART_TX_BUFFER_SIZE - 1U, "COMMAND=%s\r\n",
+                            (ActiveCommand == SINX_COMMAND) ? "SINX" : "SINY");
 						HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen, 100);
 						STPOS = 1; // Guard against printing/restarting while LogCounter is still zero.
 						StartActuators();
@@ -786,7 +795,7 @@ case PRINT_COMMAND: {
 #else
 					    PDILC_Update();            // PD ILC updates X and Y; no beta multiplier.
 #endif
-                    ILC_ActiveProfileCommand = SINESTEP_COMMAND;
+                    ILC_ActiveProfileCommand = ActiveCommand;
 
 					    // These peaks describe the corrections to be used in the next trial.
 					    float correctionPeakX = ILC_MaxCorrection(ilcCorrectionX_um);
@@ -798,11 +807,12 @@ case PRINT_COMMAND: {
 					    UARTTXLen = snprintf(
 					        (char*)UARTTXBuffer,
 					        UART_TX_BUFFER_SIZE - 1U,
-					        "Finished. X=%.4f mm, Y=%.4f mm, "
+					        "%s finished. X=%.4f mm, Y=%.4f mm, "
 					        "RMS_X_full=%.6f mm, RMS_Y_full=%.6f mm, "
 					        "RMS_X_samples_%u_to_%u=%.6f mm, "
 					        "RMS_Y_samples_%u_to_%u=%.6f mm, "
 					        "correction_peak_X_next=%.5f mm, correction_peak_Y_next=%.5f mm\r\n",
+					        (ILC_ActiveProfileCommand == SINX_COMMAND) ? "SINX" : "SINY",
 					        XActuator.MM.Position,
 					        YActuator.MM.Position,
 					        errorRMS_X,
@@ -1326,7 +1336,7 @@ case PRINT_COMMAND: {
 			UARTTXLen = sprintf((char*) UARTTXBuffer, "STOP Command\n");
 			HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen, 100);
 			StopActuators();
-			STPOS = 0; // Allow the next SIST/CIRC command to start after an abort.
+			STPOS = 0; // Allow the next SINX/SINY/CIRC command to start after an abort.
 			UARTTXLen = sprintf((char*) UARTTXBuffer, "Finished\n");
 			HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen, 100);
 			ActiveCommand = IDLE_COMMAND;
@@ -2156,8 +2166,12 @@ volatile uint8_t ProcessSerialCommand(uint8_t *SerialCommand) {
 		ActiveCommand = SQUARE_COMMAND;
 	else if (!strncmp("TRIA", (const char*) SerialCommand, 4))
 		ActiveCommand = TRIANGLE_COMMAND;
+	else if (!strncmp("SINX", (const char*) SerialCommand, 4))
+		ActiveCommand = SINX_COMMAND;
+	else if (!strncmp("SINY", (const char*) SerialCommand, 4))
+		ActiveCommand = SINY_COMMAND;
 	else if (!strncmp("SIST", (const char*) SerialCommand, 4))
-		ActiveCommand = SINESTEP_COMMAND;
+		ActiveCommand = SINX_COMMAND;  // Backward-compatible alias for SINX.
 	else if (!strncmp("PRNT", (const char*) SerialCommand, 4))
 		ActiveCommand = PRINT_COMMAND;
 	else if (!strncmp("CURR", (const char*) SerialCommand, 4))
@@ -2681,15 +2695,22 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 	float xReference = 0.0f;
 	float yReference = 0.0f;
 
-	// Generate the SINESTEP reference in the ISR.
-	if (ActiveCommand == SINESTEP_COMMAND) {
+	// Generate the selected single-axis sine reference in the ISR.
+	if (ActiveCommand == SINX_COMMAND || ActiveCommand == SINY_COMMAND) {
 
 	    if (LogCounter < SINESTEP_DURATION_SAMPLES) {
 
 		    const uint16_t k = (uint16_t)LogCounter;
+            const float sineReference =
+                R_circle * sinf(freq_circle * ((float)k / SamplingFreq));
 
-		    xReference = R_circle * sinf(freq_circle * ((float)k / SamplingFreq));
-		    yReference = 0.0f;
+            if (ActiveCommand == SINX_COMMAND) {
+                xReference = sineReference;
+                yReference = 0.0f;
+            } else {
+                xReference = 0.0f;
+                yReference = sineReference;
+            }
 
 	        const float commandedX =
 	            xReference + ILC_MicrometresToMm(ilcCorrectionX_um[k]);
@@ -2779,7 +2800,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
 			// Record both 1-second Cartesian tracking-error profiles.
 			// LogCounter is the sample index at 5 kHz. Store error in micrometres.
-			if (ActiveCommand == SINESTEP_COMMAND &&
+			if ((ActiveCommand == SINX_COMMAND || ActiveCommand == SINY_COMMAND) &&
 			    LogCounter < ILC_TRIAL_SAMPLES) {
 
 			    const uint32_t k = LogCounter;
@@ -3035,7 +3056,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
         uint32_t currentTrialIndex = 0U;
         uint8_t saveCurrentSample = 0U;
 
-        if (ActiveCommand == SINESTEP_COMMAND &&
+        if ((ActiveCommand == SINX_COMMAND || ActiveCommand == SINY_COMMAND) &&
             LogCounter < ILC_TRIAL_SAMPLES) {
             currentTrialIndex = LogCounter;
             if ((currentTrialIndex % CURRENT_LOG_DECIMATION) == 0U) {
