@@ -144,6 +144,7 @@ typedef struct {
 #define PRINT_COMMAND						22
 #define PETAL_COMMAND						23
 #define EPITROCHOID_COMMAND					24
+#define CURRENT_PRINT_COMMAND				25  // Temporary X/Y current log output
 
 ////////////////////////////////////////////////////////////////////////////////
 /* Control Mode --------------------------------------------------------------*/
@@ -193,17 +194,21 @@ typedef struct {
 #define ILC_USE_MODEL_INVERSE     0U    // 1: model inverse; 0: PD ILC, for both axes.
 #define ILC_MAX_CORRECTION_MM     2.0f
 #define MODEL_INVERSE_Q_FC_HZ     300.0f
-#define PDILC_Q_FC_HZ             100.0f
+#define PDILC_Q_FC_HZ             50.0f
 
 // Independent PD-ILC gains for each Cartesian axis. Tune X and Y separately.
 // The initial values preserve the previous gains; update them independently as needed.
-#define PDILC_KP_X                0.5f
-#define PDILC_KD_X               15.0f
-#define PDILC_KP_Y                0.1f
-#define PDILC_KD_Y               15.0f
+#define PDILC_KP_X                0.9f
+#define PDILC_KD_X               10.0f
+#define PDILC_KP_Y                0.9f
+#define PDILC_KD_Y               10.0f
 
 #define ILC_TRIAL_SAMPLES         5000U
 #define ILC_RMS_START_SAMPLE      1000U  // 1-based sample number; steady RMS includes samples 1000 through 5000.
+
+// Temporary current logging: retain every 10th ILC sample (nominally 500 Hz).
+#define CURRENT_LOG_DECIMATION    10U
+#define CURRENT_LOG_SAMPLES       ((ILC_TRIAL_SAMPLES + CURRENT_LOG_DECIMATION - 1U) / CURRENT_LOG_DECIMATION)
 #define SINESTEP_DURATION_SAMPLES ILC_TRIAL_SAMPLES
 #define SINESTEP_SETTLE_SAMPLES    2500U
 
@@ -266,6 +271,10 @@ static volatile int16_t ilcErrorX_um[ILC_TRIAL_SAMPLES] = {0};
 static volatile int16_t ilcCorrectionX_um[ILC_TRIAL_SAMPLES] = {0};
 static volatile int16_t ilcErrorY_um[ILC_TRIAL_SAMPLES] = {0};
 static volatile int16_t ilcCorrectionY_um[ILC_TRIAL_SAMPLES] = {0};
+
+// Temporary current capture in milliamps; downsampled to reduce SRAM use.
+static volatile int16_t currentLogX_mA[CURRENT_LOG_SAMPLES] = {0};
+static volatile int16_t currentLogY_mA[CURRENT_LOG_SAMPLES] = {0};
 
 //uint32_t LogC[1000];
 //float EC_ConEffX_LOG[2000] ;
@@ -572,6 +581,31 @@ int main(void)
 		            UARTTXLen,
 		            100
 		        );
+		    }
+
+		    ActiveCommand = IDLE_COMMAND;
+		    break;
+
+		case CURRENT_PRINT_COMMAND:
+
+		    HAL_UART_DMAStop(&huart2);
+
+		    // Columns: original LogCounter sample index, X current [mA], Y current [mA].
+		    UARTTXLen = snprintf(
+		        (char*)UARTTXBuffer,
+		        UART_TX_BUFFER_SIZE - 1U,
+		        "sample,I_X_mA,I_Y_mA\r\n");
+		    HAL_UART_Transmit(&huart2, (uint8_t*)UARTTXBuffer, UARTTXLen, 100);
+
+		    for (uint32_t ii = 0U; ii < CURRENT_LOG_SAMPLES; ii++) {
+		        UARTTXLen = snprintf(
+		            (char*)UARTTXBuffer,
+		            UART_TX_BUFFER_SIZE - 1U,
+		            "%lu,%d,%d\r\n",
+		            (unsigned long)(ii * CURRENT_LOG_DECIMATION),
+		            (int)currentLogX_mA[ii],
+		            (int)currentLogY_mA[ii]);
+		        HAL_UART_Transmit(&huart2, (uint8_t*)UARTTXBuffer, UARTTXLen, 100);
 		    }
 
 		    ActiveCommand = IDLE_COMMAND;
@@ -2056,6 +2090,8 @@ volatile uint8_t ProcessSerialCommand(uint8_t *SerialCommand) {
 		ActiveCommand = SINESTEP_COMMAND;
 	else if (!strncmp("PRNT", (const char*) SerialCommand, 4))
 		ActiveCommand = PRINT_COMMAND;
+	else if (!strncmp("CURR", (const char*) SerialCommand, 4))
+		ActiveCommand = CURRENT_PRINT_COMMAND;
 
 	else
 		ActiveCommand = IDLE_COMMAND;
@@ -2227,8 +2263,8 @@ static float ILC_MaxCorrection(const volatile int16_t *correctionUm)
 /* Apply the selected PD-ILC learning law to both axes. */
 static void PDILC_Update(void)
 {
-//    PDILC_UpdateAxis(ilcErrorX_um, ilcCorrectionX_um, PDILC_KP_X, PDILC_KD_X);
-//    PDILC_UpdateAxis(ilcErrorY_um, ilcCorrectionY_um, PDILC_KP_Y, PDILC_KD_Y);
+    PDILC_UpdateAxis(ilcErrorX_um, ilcCorrectionX_um, PDILC_KP_X, PDILC_KD_X);
+    PDILC_UpdateAxis(ilcErrorY_um, ilcCorrectionY_um, PDILC_KP_Y, PDILC_KD_Y);
 }
 
 
@@ -2852,6 +2888,21 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 //			LogData();
 			YActuator.EM.Counter++;
 			break;
+		}
+
+		// Temporary current logging during the SINESTEP/ILC trial.
+		// This is after EMeasurement() for the active electrical control mode.
+		// Store every 10th sample in mA to limit RAM usage.
+		if (ActiveCommand == SINESTEP_COMMAND &&
+		    LogCounter < ILC_TRIAL_SAMPLES &&
+		    (LogCounter % CURRENT_LOG_DECIMATION) == 0U) {
+		    const uint32_t currentLogIndex = LogCounter / CURRENT_LOG_DECIMATION;
+		    if (currentLogIndex < CURRENT_LOG_SAMPLES) {
+		        currentLogX_mA[currentLogIndex] =
+		            (int16_t)(XActuator.EM.Current * 1000.0f);
+		        currentLogY_mA[currentLogIndex] =
+		            (int16_t)(YActuator.EM.Current * 1000.0f);
+		    }
 		}
 	}
 
