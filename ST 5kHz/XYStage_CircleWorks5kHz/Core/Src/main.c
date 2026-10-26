@@ -565,16 +565,38 @@ case PRINT_COMMAND: {
 		        profileRampSeconds = CIRCLE_RAMP_DURATION_S;
 		    }
 
+#if ILC_USE_MODEL_INVERSE
+		    // Include the selected ILC method and its active settings in each PRNT block.
+		    // This header is printed only on request; it does not alter real-time control.
 		    UARTTXLen = snprintf(
 		        (char*)UARTTXBuffer,
 		        UART_TX_BUFFER_SIZE - 1U,
-		        "DATA_BEGIN,command=%s,samples=%u,Fs_Hz=%.0f,R_mm=%.6f,freq_Hz=%.6f,ramp_s=%.6f\r\n",
+		        "DATA_BEGIN,ILC=MI,beta=%.6f,fc_Hz=%.6f,command=%s,samples=%u,Fs_Hz=%.0f,R_mm=%.6f,freq_Hz=%.6f,ramp_s=%.6f\r\n",
+		        (double)ILC_BETA,
+		        (double)MODEL_INVERSE_Q_FC_HZ,
 		        profileName,
 		        (unsigned int)ILC_TRIAL_SAMPLES,
 		        (double)SamplingFreq,
 		        (double)R_circle,
 		        (double)(freq_circle / (2.0f * (float)M_PI)),
 		        (double)profileRampSeconds);
+#else
+		    UARTTXLen = snprintf(
+		        (char*)UARTTXBuffer,
+		        UART_TX_BUFFER_SIZE - 1U,
+		        "DATA_BEGIN,ILC=PD,KPX=%.6f,KDX=%.6f,KPY=%.6f,KDY=%.6f,fc_Hz=%.6f,command=%s,samples=%u,Fs_Hz=%.0f,R_mm=%.6f,freq_Hz=%.6f,ramp_s=%.6f\r\n",
+		        (double)PDILC_KP_X,
+		        (double)PDILC_KD_X,
+		        (double)PDILC_KP_Y,
+		        (double)PDILC_KD_Y,
+		        (double)PDILC_Q_FC_HZ,
+		        profileName,
+		        (unsigned int)ILC_TRIAL_SAMPLES,
+		        (double)SamplingFreq,
+		        (double)R_circle,
+		        (double)(freq_circle / (2.0f * (float)M_PI)),
+		        (double)profileRampSeconds);
+#endif
 		    HAL_UART_Transmit(&huart2, (uint8_t*)UARTTXBuffer, UARTTXLen, 100);
 
 		    UARTTXLen = snprintf(
