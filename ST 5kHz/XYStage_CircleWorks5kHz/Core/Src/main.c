@@ -215,6 +215,13 @@ typedef struct {
 #define SINESTEP_TOTAL_SAMPLES \
     (SINESTEP_DURATION_SAMPLES + SINESTEP_SETTLE_SAMPLES)
 
+// CIRCLE ILC: ramp to the circle start point, learn over one repeatable
+// 1-second circular segment, then hold at that same point for settling.
+#define CIRCLE_RAMP_DURATION_S   0.25f
+#define CIRCLE_RAMP_SAMPLES      ((uint32_t)(CIRCLE_RAMP_DURATION_S * SamplingFreq))
+#define CIRCLE_TRIAL_END_SAMPLE  (CIRCLE_RAMP_SAMPLES + ILC_TRIAL_SAMPLES)
+#define CIRCLE_TOTAL_SAMPLES     (CIRCLE_TRIAL_END_SAMPLE + SINESTEP_SETTLE_SAMPLES)
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -257,6 +264,10 @@ volatile float TEMP;
 volatile uint32_t LogCounter = 0;
 volatile uint32_t PrintNumbers ;
 
+// The correction profile is shared between commands to conserve SRAM. Keep
+// it when repeating the same task, but clear it when switching trajectory type.
+static uint8_t ILC_ActiveProfileCommand = IDLE_COMMAND;
+
 
 //float CURRENTLOG_V[2000];
 //float CURRENTLOG_U[2000];
@@ -294,7 +305,11 @@ static volatile int16_t currentLogY_mA[CURRENT_LOG_SAMPLES] = {0};
 
 volatile uint32_t PrintNumbers = 2000;
 const float R_circle =  2.0f;                 //radius of circle
-const float freq_circle = 10.0f * M_PI * 2.0f; // frequency
+const float freq_circle = 10.0f * M_PI * 2.0f; // angular frequency (10 Hz)
+
+// Calculated at CIRC startup; the ISR uses this same point for ramp end and hold.
+static volatile float circleStartX_mm = 0.0f;
+static volatile float circleStartY_mm = 0.0f;
 
 const float petal_freq = 2.0f * (2.0f * M_PI);   // = π/2 ≈ 1.5708
 const float petal_dim =  3.0f;                 //radius of circle
@@ -376,6 +391,7 @@ void ReInitMechanicalController();
 // ILC conversion helpers, performance metrics, and update laws.
 static int16_t ILC_MmToMicrometres(float valueMm);
 static float ILC_MicrometresToMm(int16_t valueUm);
+static void ILC_ResetCorrections(void);
 static void PDILC_Update(void);
 static void PDILC_UpdateAxis(
     volatile int16_t *errorUm, volatile int16_t *correctionUm,
@@ -590,7 +606,7 @@ int main(void)
 
 		    HAL_UART_DMAStop(&huart2);
 
-		    // Columns: original LogCounter sample index, X current [mA], Y current [mA].
+		    // Columns: zero-based ILC trial sample index, X current [mA], Y current [mA].
 		    UARTTXLen = snprintf(
 		        (char*)UARTTXBuffer,
 		        UART_TX_BUFFER_SIZE - 1U,
@@ -715,6 +731,10 @@ int main(void)
 		case SINESTEP_COMMAND:
 
 					if (LogCounter == 0) {
+                        if (ILC_ActiveProfileCommand != SINESTEP_COMMAND) {
+                            ILC_ResetCorrections();
+                            ILC_ActiveProfileCommand = SINESTEP_COMMAND;
+                        }
 						HAL_UART_DMAStop(&huart2);
 						UARTTXLen = sprintf((char*) UARTTXBuffer,
 								"U AXIS CURRENT STEP COMMAND\n");
@@ -757,6 +777,7 @@ int main(void)
 #else
 					    PDILC_Update();            // PD ILC updates X and Y; no beta multiplier.
 #endif
+                    ILC_ActiveProfileCommand = SINESTEP_COMMAND;
 
 					    // These peaks describe the corrections to be used in the next trial.
 					    float correctionPeakX = ILC_MaxCorrection(ilcCorrectionX_um);
@@ -932,41 +953,80 @@ int main(void)
 		case CIRCLE_COMMAND:
 
 			if (LogCounter == 0) {
+                if (ILC_ActiveProfileCommand != CIRCLE_COMMAND) {
+                    // Never reuse corrections learned for a different path.
+                    // Thus the first CIRC trial starts with zero ILC correction.
+                    ILC_ResetCorrections();
+                    ILC_ActiveProfileCommand = CIRCLE_COMMAND;
+                }
+
 				HAL_UART_DMAStop(&huart2);
-				UARTTXLen = sprintf((char*) UARTTXBuffer, "SINE COMMAND\n");
-				HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen,
-						100);
-				StartActuators();
+				UARTTXLen = sprintf((char*) UARTTXBuffer, "CIRCLE ILC COMMAND\n");
+				HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen, 100);
+
+                // The previous CIRC ramp ended at the circle point corresponding
+                // to t = 0.25 s. Reuse that exact point for every trial's start/end.
+                const float circleStartTime =
+                    (float)CIRCLE_RAMP_SAMPLES / SamplingFreq;
+                const float circleStartPhase = freq_circle * circleStartTime;
+                circleStartX_mm = R_circle * sinf(circleStartPhase);
+                circleStartY_mm = R_circle * cosf(circleStartPhase);
+
 				STPOS = 1;
-			} else if (LogCounter < 0.25f * SamplingFreq) {
+				StartActuators();
 
-				float omegaT_dummy = 0.25f * freq_circle;
-				float position_start_X  = ( R_circle * sinf(omegaT_dummy) / (0.25f * SamplingFreq) ) * (LogCounter);
-				float position_start_Y  = ( R_circle * cosf(omegaT_dummy) / (0.25f * SamplingFreq) ) * (LogCounter);
-				SetControlParameters(1, POSITION_CONTROL,
-						position_start_X, position_start_Y,
-									DONT_CHANGE_IT, 0, 0, 0);
+            } else if (LogCounter < CIRCLE_TOTAL_SAMPLES) {
+                // Reference trajectory, error recording, and current logging
+                // are handled in HAL_ADC_ConvCpltCallback().
 
+			} else {
 
-			} else if (LogCounter <= 2.5 * SamplingFreq) {
+                SetControlParameters(0, MEASUREMENT_ONLY, 0.0f, 0.0f,
+                                     MEASUREMENT_ONLY, 0.0f, 0.0f, 0);
+                StopActuators();
 
-				float omegaT = (float) (LogCounter) / SamplingFreq * freq_circle;
-				SetControlParameters(1, POSITION_CONTROL,
-						R_circle * sinf(omegaT), R_circle * cosf(omegaT),
-						DONT_CHANGE_IT, 0, 0, 0);
+                // Evaluate only the 1-second circular ILC segment. The 0.25 s
+                // ramp and 0.5 s hold are deliberately excluded from learning.
+                float errorRMS_X = ILC_CalculateRMS(ilcErrorX_um);
+                float errorRMS_Y = ILC_CalculateRMS(ilcErrorY_um);
+                float errorRMS_X_SteadyState = ILC_CalculateRMS_SteadyState(ilcErrorX_um);
+                float errorRMS_Y_SteadyState = ILC_CalculateRMS_SteadyState(ilcErrorY_um);
 
-			} else if (LogCounter > 2.5 * SamplingFreq) {
+#if ILC_USE_MODEL_INVERSE
+                ModelInverseILC_Update();
+#else
+                PDILC_Update();
+#endif
 
-				SetControlParameters(0, MEASUREMENT_ONLY, 0, 0,
-				MEASUREMENT_ONLY, 0, 0, 0);
-				StopActuators();
-				ActiveCommand = IDLE_COMMAND;
-				STPOS = 0;
-				UARTTXLen = sprintf((char*) UARTTXBuffer, "Finished\n");
-				HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen,
-						100);
+                float correctionPeakX = ILC_MaxCorrection(ilcCorrectionX_um);
+                float correctionPeakY = ILC_MaxCorrection(ilcCorrectionY_um);
+
+                ActiveCommand = IDLE_COMMAND;
+                STPOS = 0;
+
+                UARTTXLen = snprintf(
+                    (char*)UARTTXBuffer,
+                    UART_TX_BUFFER_SIZE - 1U,
+                    "CIRC finished. X=%.4f mm, Y=%.4f mm, "
+                    "RMS_X_full=%.6f mm, RMS_Y_full=%.6f mm, "
+                    "RMS_X_samples_%u_to_%u=%.6f mm, "
+                    "RMS_Y_samples_%u_to_%u=%.6f mm, "
+                    "correction_peak_X_next=%.5f mm, correction_peak_Y_next=%.5f mm\r\n",
+                    XActuator.MM.Position,
+                    YActuator.MM.Position,
+                    errorRMS_X,
+                    errorRMS_Y,
+                    (unsigned int)ILC_RMS_START_SAMPLE,
+                    (unsigned int)ILC_TRIAL_SAMPLES,
+                    errorRMS_X_SteadyState,
+                    (unsigned int)ILC_RMS_START_SAMPLE,
+                    (unsigned int)ILC_TRIAL_SAMPLES,
+                    errorRMS_Y_SteadyState,
+                    correctionPeakX,
+                    correctionPeakY);
+
+                HAL_UART_Transmit(&huart2, (uint8_t*)UARTTXBuffer, UARTTXLen, 100);
 			}
-
 			break;
 
 		case PETAL_COMMAND:
@@ -2211,6 +2271,16 @@ static float ILC_MicrometresToMm(int16_t valueUm)
 }
 
 
+/* Clear the shared correction profile only when switching trajectory type. */
+static void ILC_ResetCorrections(void)
+{
+    for (uint32_t k = 0U; k < ILC_TRIAL_SAMPLES; ++k) {
+        ilcCorrectionX_um[k] = 0;
+        ilcCorrectionY_um[k] = 0;
+    }
+}
+
+
 static float ILC_CalculateRMS(const volatile int16_t *errorUm)
 {
     float sum = 0.0f;
@@ -2644,6 +2714,51 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 	    }
 	}
 
+    // CIRC reference generation is handled here in the same real-time path.
+    if (ActiveCommand == CIRCLE_COMMAND) {
+        if (LogCounter < CIRCLE_RAMP_SAMPLES) {
+            // Unlearned linear ramp from the origin to the circle start point.
+            const float rampFraction =
+                (float)LogCounter / (float)CIRCLE_RAMP_SAMPLES;
+            xReference = circleStartX_mm * rampFraction;
+            yReference = circleStartY_mm * rampFraction;
+
+            SetControlParameters(
+                1, POSITION_CONTROL, xReference, yReference,
+                DONT_CHANGE_IT, 0.0f, 0.0f, 0);
+
+        } else if (LogCounter < CIRCLE_TRIAL_END_SAMPLE) {
+            // The ILC sample index starts AFTER the ramp, so the ramp is never
+            // stored in the error profile and never receives learned correction.
+            const uint32_t k = LogCounter - CIRCLE_RAMP_SAMPLES;
+            const float trialTime = (float)k / SamplingFreq;
+            const float rampEndTime = (float)CIRCLE_RAMP_SAMPLES / SamplingFreq;
+            const float omegaT = freq_circle * (rampEndTime + trialTime);
+
+            xReference = R_circle * sinf(omegaT);
+            yReference = R_circle * cosf(omegaT);
+
+            const float commandedX =
+                xReference + ILC_MicrometresToMm(ilcCorrectionX_um[k]);
+            const float commandedY =
+                yReference + ILC_MicrometresToMm(ilcCorrectionY_um[k]);
+
+            SetControlParameters(
+                1, POSITION_CONTROL, commandedX, commandedY,
+                DONT_CHANGE_IT, 0.0f, 0.0f, 0);
+
+        } else if (LogCounter < CIRCLE_TOTAL_SAMPLES) {
+            // One-second circular segment completes 10 full cycles at 10 Hz.
+            // Hold at the same point on the circle, NOT at the origin.
+            xReference = circleStartX_mm;
+            yReference = circleStartY_mm;
+
+            SetControlParameters(
+                1, POSITION_CONTROL, circleStartX_mm, circleStartY_mm,
+                DONT_CHANGE_IT, 0.0f, 0.0f, 0);
+        }
+    }
+
 	if (YActuator.ControllerActive) {
 
 		switch (YActuator.MC.ControlMode) {
@@ -2657,13 +2772,26 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 			if (ActiveCommand == SINESTEP_COMMAND &&
 			    LogCounter < ILC_TRIAL_SAMPLES) {
 
-			    const uint16_t k = (uint16_t)LogCounter;
+			    const uint32_t k = LogCounter;
 
-			    // Tracking error = reference - measured position.
+			    // Tracking error = original reference - measured position.
 			    ilcErrorX_um[k] = ILC_MmToMicrometres(
 			        xReference - XActuator.MM.Position);
 			    ilcErrorY_um[k] = ILC_MmToMicrometres(
 			        yReference - YActuator.MM.Position);
+
+            } else if (ActiveCommand == CIRCLE_COMMAND &&
+                       LogCounter >= CIRCLE_RAMP_SAMPLES &&
+                       LogCounter < CIRCLE_TRIAL_END_SAMPLE) {
+
+                const uint32_t k = LogCounter - CIRCLE_RAMP_SAMPLES;
+
+                // Store only circular-segment errors. The approach ramp and
+                // the hold at the circle start point are not part of ILC.
+                ilcErrorX_um[k] = ILC_MmToMicrometres(
+                    xReference - XActuator.MM.Position);
+                ilcErrorY_um[k] = ILC_MmToMicrometres(
+                    yReference - YActuator.MM.Position);
 			}
 
 
@@ -2890,20 +3018,36 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 			break;
 		}
 
-		// Temporary current logging during the SINESTEP/ILC trial.
+		// Temporary current logging during the ILC segment.
 		// This is after EMeasurement() for the active electrical control mode.
-		// Store every 10th sample in mA to limit RAM usage.
-		if (ActiveCommand == SINESTEP_COMMAND &&
-		    LogCounter < ILC_TRIAL_SAMPLES &&
-		    (LogCounter % CURRENT_LOG_DECIMATION) == 0U) {
-		    const uint32_t currentLogIndex = LogCounter / CURRENT_LOG_DECIMATION;
-		    if (currentLogIndex < CURRENT_LOG_SAMPLES) {
-		        currentLogX_mA[currentLogIndex] =
-		            (int16_t)(XActuator.EM.Current * 1000.0f);
-		        currentLogY_mA[currentLogIndex] =
-		            (int16_t)(YActuator.EM.Current * 1000.0f);
-		    }
-		}
+		// Store every 10th trial sample in mA; CIRC's ramp is excluded.
+        uint32_t currentLogIndex = 0U;
+        uint32_t currentTrialIndex = 0U;
+        uint8_t saveCurrentSample = 0U;
+
+        if (ActiveCommand == SINESTEP_COMMAND &&
+            LogCounter < ILC_TRIAL_SAMPLES) {
+            currentTrialIndex = LogCounter;
+            if ((currentTrialIndex % CURRENT_LOG_DECIMATION) == 0U) {
+                currentLogIndex = currentTrialIndex / CURRENT_LOG_DECIMATION;
+                saveCurrentSample = 1U;
+            }
+        } else if (ActiveCommand == CIRCLE_COMMAND &&
+                   LogCounter >= CIRCLE_RAMP_SAMPLES &&
+                   LogCounter < CIRCLE_TRIAL_END_SAMPLE) {
+            currentTrialIndex = LogCounter - CIRCLE_RAMP_SAMPLES;
+            if ((currentTrialIndex % CURRENT_LOG_DECIMATION) == 0U) {
+                currentLogIndex = currentTrialIndex / CURRENT_LOG_DECIMATION;
+                saveCurrentSample = 1U;
+            }
+        }
+
+        if (saveCurrentSample && currentLogIndex < CURRENT_LOG_SAMPLES) {
+            currentLogX_mA[currentLogIndex] =
+                (int16_t)(XActuator.EM.Current * 1000.0f);
+            currentLogY_mA[currentLogIndex] =
+                (int16_t)(YActuator.EM.Current * 1000.0f);
+        }
 	}
 
 
