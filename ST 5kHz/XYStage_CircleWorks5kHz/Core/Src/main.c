@@ -546,38 +546,41 @@ int main(void)
 
 			break;
 
-//		case PRINT_COMMAND:
-//
-//			HAL_UART_DMAStop(&huart2);
-//			for (int ii = 0; ii < PrintNumbers; ii++) {
-//				UARTTXLen = snprintf((char*) UARTTXBuffer,
-//				UART_TX_BUFFER_SIZE - 1, "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
-//
-//				CURRENTLOG_U[ii], CURRENTLOG_V[ii],
-//				PosLog_U[ii],PosLog_V[ii],
-//						PosLog_X[ii], PosLog_Y[ii]);
-////						,LogC[ii]);
-////				XActuator.MC.DesiredValueX,YActuator.MC.DesiredValueX,
-////				XActuator.MC.DesiredValueY,YActuator.MC.DesiredValueY,
-////				MC_ErrX_LOG[ii],MC_ErrY_LOG[ii]);
-////				EC_ErrX_LOG[ii],EC_ErrY_LOG[ii]);
-////				EC_ConEffX_LOG[ii], EC_ConEffY_LOG[ii]);
-//
-//
-//
-//				HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen,
-//						100);
-//			}
-//			ActiveCommand = IDLE_COMMAND;
-//
-//			break;
-
-		case PRINT_COMMAND:
+case PRINT_COMMAND: {
 
 		    HAL_UART_DMAStop(&huart2);
 
-		    // Columns: sample, X error [mm], X correction for next trial [mm],
-		    //          Y error [mm], Y correction for next trial [mm].
+		    // Mark the data block so multiple trials can be pasted into one log file.
+		    // The command identifies which reference MATLAB should reconstruct.
+		    const char *profileName = "UNKNOWN";
+		    float profileRampSeconds = 0.0f;
+		    if (ILC_ActiveProfileCommand == SINESTEP_COMMAND) {
+		        profileName = "SIST";
+		    } else if (ILC_ActiveProfileCommand == CIRCLE_COMMAND) {
+		        profileName = "CIRC";
+		        profileRampSeconds = CIRCLE_RAMP_DURATION_S;
+		    }
+
+		    UARTTXLen = snprintf(
+		        (char*)UARTTXBuffer,
+		        UART_TX_BUFFER_SIZE - 1U,
+		        "DATA_BEGIN,command=%s,samples=%u,Fs_Hz=%.0f,R_mm=%.6f,freq_Hz=%.6f,ramp_s=%.6f\r\n",
+		        profileName,
+		        (unsigned int)ILC_TRIAL_SAMPLES,
+		        (double)SamplingFreq,
+		        (double)R_circle,
+		        (double)(freq_circle / (2.0f * (float)M_PI)),
+		        (double)profileRampSeconds);
+		    HAL_UART_Transmit(&huart2, (uint8_t*)UARTTXBuffer, UARTTXLen, 100);
+
+		    UARTTXLen = snprintf(
+		        (char*)UARTTXBuffer,
+		        UART_TX_BUFFER_SIZE - 1U,
+		        "sample,errorX_mm,correctionX_next_mm,errorY_mm,correctionY_next_mm\r\n");
+		    HAL_UART_Transmit(&huart2, (uint8_t*)UARTTXBuffer, UARTTXLen, 100);
+
+		    // Columns: zero-based sample, X error, next-trial X correction,
+		    // Y error, next-trial Y correction. Error is reference minus measured output.
 		    for (uint32_t ii = 0U; ii < ILC_TRIAL_SAMPLES; ii++) {
 
 		        UARTTXLen = snprintf(
@@ -599,8 +602,14 @@ int main(void)
 		        );
 		    }
 
+		    UARTTXLen = snprintf((char*)UARTTXBuffer,
+		                         UART_TX_BUFFER_SIZE - 1U,
+		                         "DATA_END,command=%s\r\n", profileName);
+		    HAL_UART_Transmit(&huart2, (uint8_t*)UARTTXBuffer, UARTTXLen, 100);
+
 		    ActiveCommand = IDLE_COMMAND;
 		    break;
+		}
 
 		case CURRENT_PRINT_COMMAND:
 
@@ -730,16 +739,16 @@ int main(void)
 
 		case SINESTEP_COMMAND:
 
-					if (LogCounter == 0) {
+					if (LogCounter == 0 && STPOS == 0) {
                         if (ILC_ActiveProfileCommand != SINESTEP_COMMAND) {
                             ILC_ResetCorrections();
                             ILC_ActiveProfileCommand = SINESTEP_COMMAND;
                         }
 						HAL_UART_DMAStop(&huart2);
 						UARTTXLen = sprintf((char*) UARTTXBuffer,
-								"U AXIS CURRENT STEP COMMAND\n");
+								"COMMAND=SIST\r\n");
 						HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen, 100);
-						STPOS = 1;
+						STPOS = 1; // Guard against printing/restarting while LogCounter is still zero.
 						StartActuators();
 
 					} else if (LogCounter <
@@ -952,7 +961,7 @@ int main(void)
 
 		case CIRCLE_COMMAND:
 
-			if (LogCounter == 0) {
+			if (LogCounter == 0 && STPOS == 0) {
                 if (ILC_ActiveProfileCommand != CIRCLE_COMMAND) {
                     // Never reuse corrections learned for a different path.
                     // Thus the first CIRC trial starts with zero ILC correction.
@@ -961,7 +970,7 @@ int main(void)
                 }
 
 				HAL_UART_DMAStop(&huart2);
-				UARTTXLen = sprintf((char*) UARTTXBuffer, "CIRCLE ILC COMMAND\n");
+				UARTTXLen = sprintf((char*) UARTTXBuffer, "COMMAND=CIRC\r\n");
 				HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen, 100);
 
                 // The previous CIRC ramp ended at the circle point corresponding
@@ -1317,6 +1326,7 @@ int main(void)
 			UARTTXLen = sprintf((char*) UARTTXBuffer, "STOP Command\n");
 			HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen, 100);
 			StopActuators();
+			STPOS = 0; // Allow the next SIST/CIRC command to start after an abort.
 			UARTTXLen = sprintf((char*) UARTTXBuffer, "Finished\n");
 			HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen, 100);
 			ActiveCommand = IDLE_COMMAND;
