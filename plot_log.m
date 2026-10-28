@@ -15,7 +15,7 @@
 % The first trial after a command/profile switch is assumed to have u_ILC = 0.
 %
 % SIST is accepted as a legacy command name, but is always displayed as SINX.
-% Supported references: SINX, SINY, and CIRC.
+% Supported references: SINX, SINY, CIRC, and PETAL.
 
 clc;
 clear;
@@ -40,6 +40,8 @@ emptyTrial = struct( ...
     'R', NaN, ...
     'freqHz', NaN, ...
     'rampS', NaN, ...
+    'petalNum', NaN, ...
+    'petalTurn', NaN, ...
     'ilcMode', 'UNKNOWN', ...
     'beta', NaN, ...
     'ilcFcHz', NaN, ...
@@ -92,6 +94,8 @@ for lineIndex = 1:numel(loglines)
         currentTrial.R = metadata.R;
         currentTrial.freqHz = metadata.freqHz;
         currentTrial.rampS = metadata.rampS;
+        currentTrial.petalNum = metadata.petalNum;
+        currentTrial.petalTurn = metadata.petalTurn;
         currentTrial.ilcMode = metadata.ilcMode;
         currentTrial.beta = metadata.beta;
         currentTrial.ilcFcHz = metadata.ilcFcHz;
@@ -172,8 +176,10 @@ for kTrial = 1:numTrials
         previous = trials(kTrial - 1);
         current = trials(kTrial);
         sameReference = strcmp(Command{kTrial}, Command{kTrial - 1}) && ...
-            isequaln([current.R, current.freqHz, current.rampS, current.Fs], ...
-                     [previous.R, previous.freqHz, previous.rampS, previous.Fs]);
+            isequaln([current.R, current.freqHz, current.rampS, current.Fs, ...
+                      current.petalNum, current.petalTurn], ...
+                     [previous.R, previous.freqHz, previous.rampS, previous.Fs, ...
+                      previous.petalNum, previous.petalTurn]);
         sameILCSettings = strcmp(current.ilcMode, previous.ilcMode) && ...
             isequaln([current.beta, current.ilcFcHz, current.kpX, current.kdX, ...
                       current.kpY, current.kdY], ...
@@ -210,6 +216,16 @@ for kTrial = 1:numTrials
             phase = omega * (trials(kTrial).rampS + t);
             trials(kTrial).xReference = trials(kTrial).R * sin(phase);
             trials(kTrial).yReference = trials(kTrial).R * cos(phase);
+
+        case 'PETAL'
+            % Match the STM32 petal reference over the logged learning window.
+            % The firmware uses theta = petalTurn*(rampS + t)*petal_freq,
+            % with petal_freq = 2*pi*freqHz.
+            theta = trials(kTrial).petalTurn .* ...
+                (trials(kTrial).rampS + t) .* omega;
+            petalEnvelope = cos(trials(kTrial).petalNum .* theta);
+            trials(kTrial).xReference = trials(kTrial).R .* petalEnvelope .* cos(theta);
+            trials(kTrial).yReference = trials(kTrial).R .* petalEnvelope .* sin(theta);
 
         otherwise
             warning('Unsupported command %s. Reference will be NaN.', trials(kTrial).command);
@@ -274,6 +290,8 @@ R_mm = NaN(numSequences, 1);
 Frequency_Hz = NaN(numSequences, 1);
 Sampling_Hz = NaN(numSequences, 1);
 Ramp_s = NaN(numSequences, 1);
+Petal_Num = NaN(numSequences, 1);
+Petal_Turn = NaN(numSequences, 1);
 ILC_Mode = cell(numSequences, 1);
 Beta = NaN(numSequences, 1);
 ILC_fc_Hz = NaN(numSequences, 1);
@@ -296,6 +314,8 @@ for iSeq = 1:numSequences
     Frequency_Hz(iSeq) = tr.freqHz;
     Sampling_Hz(iSeq) = tr.Fs;
     Ramp_s(iSeq) = tr.rampS;
+    Petal_Num(iSeq) = tr.petalNum;
+    Petal_Turn(iSeq) = tr.petalTurn;
     ILC_Mode{iSeq} = tr.ilcMode;
     Beta(iSeq) = tr.beta;
     ILC_fc_Hz(iSeq) = tr.ilcFcHz;
@@ -307,10 +327,11 @@ for iSeq = 1:numSequences
 end
 
 settingsTable = table(SettingsSequence, SettingsCommand, ReferenceSignal, ...
-    R_mm, Frequency_Hz, Sampling_Hz, Ramp_s, ILC_Mode, Beta, ILC_fc_Hz, ...
-    KPX, KDX, KPY, KDY, LoggedTrials, ...
+    R_mm, Frequency_Hz, Sampling_Hz, Ramp_s, Petal_Num, Petal_Turn, ...
+    ILC_Mode, Beta, ILC_fc_Hz, KPX, KDX, KPY, KDY, LoggedTrials, ...
     'VariableNames', {'Sequence','Command','ReferenceSignal','R_mm','Frequency_Hz', ...
-    'Sampling_Hz','Ramp_s','ILC_Mode','Beta','ILC_fc_Hz','KPX','KDX','KPY','KDY','LoggedTrials'});
+    'Sampling_Hz','Ramp_s','Petal_Num','Petal_Turn','ILC_Mode','Beta','ILC_fc_Hz', ...
+    'KPX','KDX','KPY','KDY','LoggedTrials'});
 
 fprintf('Reference and ILC settings for each logged sequence:\n');
 disp(settingsTable);
@@ -324,6 +345,8 @@ for iSeq = 1:numSequences
     fprintf('  %-16s : %.3f\n','Frequency_Hz',    Frequency_Hz(iSeq));
     fprintf('  %-16s : %.1f\n','Sampling_Hz',     Sampling_Hz(iSeq));
     fprintf('  %-16s : %.3f\n','Ramp_s',          Ramp_s(iSeq));
+    fprintf('  %-16s : %.3f\n','Petal_Num',       Petal_Num(iSeq));
+    fprintf('  %-16s : %.3f\n','Petal_Turn',      Petal_Turn(iSeq));
     fprintf('  %-16s : %s\n',  'ILC_Mode',        ILC_Mode{iSeq});
     fprintf('  %-16s : %.3f\n','Beta',            Beta(iSeq));
     fprintf('  %-16s : %.3f\n','ILC_fc_Hz',       ILC_fc_Hz(iSeq));
@@ -366,7 +389,7 @@ for sequenceIndex = 1:numel(sequenceList)
         'LineWidth', 1.6, 'DisplayName', 'Reference');
     for jj = 1:nGroup
         ii = groupIndices(jj);
-        plot(trials(ii).t, trials(ii).xMeasured, 'Color', clrs(ii, :), ...
+        plot(trials(ii).t, trials(ii).xMeasured, 'Color', clrs(jj, :), ...
             'DisplayName', sprintf('Iteration %d', TrialNumber(ii)));
     end
     title('X position'); xlabel('Time (s)'); ylabel('X (mm)');
@@ -377,7 +400,7 @@ for sequenceIndex = 1:numel(sequenceList)
         'LineWidth', 1.6, 'DisplayName', 'Reference');
     for jj = 1:nGroup
         ii = groupIndices(jj);
-        plot(trials(ii).t, trials(ii).yMeasured, 'Color', clrs(ii, :), ...
+        plot(trials(ii).t, trials(ii).yMeasured, 'Color', clrs(jj, :), ...
             'DisplayName', sprintf('Iteration %d', TrialNumber(ii)));
     end
     title('Y position'); xlabel('Time (s)'); ylabel('Y (mm)');
@@ -389,7 +412,7 @@ for sequenceIndex = 1:numel(sequenceList)
     subplot(2, 1, 1); hold on; grid on;
     for jj = 1:nGroup
         ii = groupIndices(jj);
-        plot(trials(ii).t, trials(ii).errorX, 'Color', clrs(ii, :), ...
+        plot(trials(ii).t, trials(ii).errorX, 'Color', clrs(jj, :), ...
             'DisplayName', sprintf('Iteration %d', TrialNumber(ii)));
     end
     title('X tracking error'); xlabel('Time (s)'); ylabel('e_X (mm)');
@@ -398,7 +421,7 @@ for sequenceIndex = 1:numel(sequenceList)
     subplot(2, 1, 2); hold on; grid on;
     for jj = 1:nGroup
         ii = groupIndices(jj);
-        plot(trials(ii).t, trials(ii).errorY, 'Color', clrs(ii, :), ...
+        plot(trials(ii).t, trials(ii).errorY, 'Color', clrs(jj, :), ...
             'DisplayName', sprintf('Iteration %d', TrialNumber(ii)));
     end
     title('Y tracking error'); xlabel('Time (s)'); ylabel('e_Y (mm)');
@@ -412,7 +435,7 @@ for sequenceIndex = 1:numel(sequenceList)
         'LineWidth', 1.6, 'DisplayName', 'Reference');
     for jj = 1:nGroup
         ii = groupIndices(jj);
-        plot(trials(ii).xMeasured, trials(ii).yMeasured, 'Color', clrs(ii, :), ...
+        plot(trials(ii).xMeasured, trials(ii).yMeasured, 'Color', clrs(jj, :), ...
             'DisplayName', sprintf('Iteration %d', TrialNumber(ii)));
     end
     title('2D trajectory'); xlabel('X (mm)'); ylabel('Y (mm)');
@@ -451,7 +474,7 @@ for sequenceIndex = 1:numel(sequenceList)
     subplot(2, 1, 1); hold on; grid on;
     for jj = 1:nGroup
         ii = groupIndices(jj);
-        plot(trials(ii).t, trials(ii).ilcAppliedX, 'Color', clrs(ii, :), ...
+        plot(trials(ii).t, trials(ii).ilcAppliedX, 'Color', clrs(jj, :), ...
             'DisplayName', sprintf('Iteration %d', TrialNumber(ii)));
     end
     title('X-axis ILC signal applied to the reference');
@@ -461,7 +484,7 @@ for sequenceIndex = 1:numel(sequenceList)
     subplot(2, 1, 2); hold on; grid on;
     for jj = 1:nGroup
         ii = groupIndices(jj);
-        plot(trials(ii).t, trials(ii).ilcAppliedY, 'Color', clrs(ii, :), ...
+        plot(trials(ii).t, trials(ii).ilcAppliedY, 'Color', clrs(jj, :), ...
             'DisplayName', sprintf('Iteration %d', TrialNumber(ii)));
     end
     title('Y-axis ILC signal applied to the reference');
@@ -596,6 +619,8 @@ function commandName = canonicalCommand(rawCommand)
     commandName = upper(strtrim(rawCommand));
     if strcmp(commandName, 'SIST')
         commandName = 'SINX';
+    elseif strcmp(commandName, 'PETL')
+        commandName = 'PETAL';
     end
 end
 
@@ -610,6 +635,8 @@ function metadata = parseDataBeginHeader(lineText)
         'R', NaN, ...
         'freqHz', NaN, ...
         'rampS', NaN, ...
+        'petalNum', NaN, ...
+        'petalTurn', NaN, ...
         'ilcMode', 'UNKNOWN', ...
         'beta', NaN, ...
         'ilcFcHz', NaN, ...
@@ -635,6 +662,10 @@ function metadata = parseDataBeginHeader(lineText)
                 metadata.freqHz = str2double(value);
             case 'ramp_s'
                 metadata.rampS = str2double(value);
+            case 'petal_num'
+                metadata.petalNum = str2double(value);
+            case 'petal_turn'
+                metadata.petalTurn = str2double(value);
             case 'ilc'
                 metadata.ilcMode = upper(value);
             case 'beta'
@@ -667,6 +698,9 @@ function description = referenceDescriptionForCommand(commandName)
             description = 'X: 0; Y: R*sin(2*pi*f*t)';
         case 'CIRC'
             description = 'X: R*sin(2*pi*f*(t+ramp)); Y: R*cos(2*pi*f*(t+ramp))';
+        case 'PETAL'
+            description = ['theta=turn*2*pi*f*(t+ramp); X=R*cos(num*theta)*cos(theta); ' ...
+                           'Y=R*cos(num*theta)*sin(theta)'];
         otherwise
             description = 'Reference equation unavailable';
     end

@@ -224,6 +224,14 @@ typedef struct {
 #define CIRCLE_TRIAL_END_SAMPLE  (CIRCLE_RAMP_SAMPLES + ILC_TRIAL_SAMPLES)
 #define CIRCLE_TOTAL_SAMPLES     (CIRCLE_TRIAL_END_SAMPLE + SINESTEP_SETTLE_SAMPLES)
 
+// PETAL ILC uses the same repeatable structure: unlearned ramp, 1-second
+// learning window (5000 samples, four complete 0.25-second petal periods),
+// then a hold at the petal starting point while feedback remains active.
+#define PETAL_RAMP_DURATION_S   0.25f
+#define PETAL_RAMP_SAMPLES      ((uint32_t)(PETAL_RAMP_DURATION_S * SamplingFreq))
+#define PETAL_TRIAL_END_SAMPLE  (PETAL_RAMP_SAMPLES + ILC_TRIAL_SAMPLES)
+#define PETAL_TOTAL_SAMPLES     (PETAL_TRIAL_END_SAMPLE + SINESTEP_SETTLE_SAMPLES)
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -313,7 +321,11 @@ const float freq_circle = 10.0f * M_PI * 2.0f; // angular frequency (10 Hz)
 static volatile float circleStartX_mm = 0.0f;
 static volatile float circleStartY_mm = 0.0f;
 
-const float petal_freq = 2.0f * (2.0f * M_PI);   // = π/2 ≈ 1.5708
+// Calculated at PETL startup; the ISR uses this same point for ramp end and hold.
+static volatile float petalStartX_mm = 0.0f;
+static volatile float petalStartY_mm = 0.0f;
+
+const float petal_freq = 2.0f * (2.0f * M_PI);   // = 4*pi rad/s (2 Hz)
 const float petal_dim =  3.0f;                 //radius of circle
 const float petal_num =  5.0f;
 const float petal_turn = 1.0f;
@@ -556,6 +568,10 @@ case PRINT_COMMAND: {
 		    // The command identifies which reference MATLAB should reconstruct.
 		    const char *profileName = "UNKNOWN";
 		    float profileRampSeconds = 0.0f;
+		    float profileRadius_mm = R_circle;
+		    float profileFrequency_Hz = freq_circle / (2.0f * (float)M_PI);
+		    float profilePetalNum = 0.0f;
+		    float profilePetalTurn = 0.0f;
 		    if (ILC_ActiveProfileCommand == SINX_COMMAND) {
 		        profileName = "SINX";
 		    } else if (ILC_ActiveProfileCommand == SINY_COMMAND) {
@@ -563,6 +579,13 @@ case PRINT_COMMAND: {
 		    } else if (ILC_ActiveProfileCommand == CIRCLE_COMMAND) {
 		        profileName = "CIRC";
 		        profileRampSeconds = CIRCLE_RAMP_DURATION_S;
+		    } else if (ILC_ActiveProfileCommand == PETAL_COMMAND) {
+		        profileName = "PETAL";
+		        profileRampSeconds = PETAL_RAMP_DURATION_S;
+		        profileRadius_mm = petal_dim;
+		        profileFrequency_Hz = petal_freq / (2.0f * (float)M_PI);
+		        profilePetalNum = petal_num;
+		        profilePetalTurn = petal_turn;
 		    }
 
 #if ILC_USE_MODEL_INVERSE
@@ -571,20 +594,22 @@ case PRINT_COMMAND: {
 		    UARTTXLen = snprintf(
 		        (char*)UARTTXBuffer,
 		        UART_TX_BUFFER_SIZE - 1U,
-		        "DATA_BEGIN,ILC=MI,beta=%.6f,fc_Hz=%.6f,command=%s,samples=%u,Fs_Hz=%.0f,R_mm=%.6f,freq_Hz=%.6f,ramp_s=%.6f\r\n",
+		        "DATA_BEGIN,ILC=MI,beta=%.6f,fc_Hz=%.6f,command=%s,samples=%u,Fs_Hz=%.0f,R_mm=%.6f,freq_Hz=%.6f,ramp_s=%.6f,petal_num=%.6f,petal_turn=%.6f\r\n",
 		        (double)ILC_BETA,
 		        (double)MODEL_INVERSE_Q_FC_HZ,
 		        profileName,
 		        (unsigned int)ILC_TRIAL_SAMPLES,
 		        (double)SamplingFreq,
-		        (double)R_circle,
-		        (double)(freq_circle / (2.0f * (float)M_PI)),
-		        (double)profileRampSeconds);
+		        (double)profileRadius_mm,
+		        (double)profileFrequency_Hz,
+		        (double)profileRampSeconds,
+		        (double)profilePetalNum,
+		        (double)profilePetalTurn);
 #else
 		    UARTTXLen = snprintf(
 		        (char*)UARTTXBuffer,
 		        UART_TX_BUFFER_SIZE - 1U,
-		        "DATA_BEGIN,ILC=PD,KPX=%.6f,KDX=%.6f,KPY=%.6f,KDY=%.6f,fc_Hz=%.6f,command=%s,samples=%u,Fs_Hz=%.0f,R_mm=%.6f,freq_Hz=%.6f,ramp_s=%.6f\r\n",
+		        "DATA_BEGIN,ILC=PD,KPX=%.6f,KDX=%.6f,KPY=%.6f,KDY=%.6f,fc_Hz=%.6f,command=%s,samples=%u,Fs_Hz=%.0f,R_mm=%.6f,freq_Hz=%.6f,ramp_s=%.6f,petal_num=%.6f,petal_turn=%.6f\r\n",
 		        (double)PDILC_KP_X,
 		        (double)PDILC_KD_X,
 		        (double)PDILC_KP_Y,
@@ -593,9 +618,11 @@ case PRINT_COMMAND: {
 		        profileName,
 		        (unsigned int)ILC_TRIAL_SAMPLES,
 		        (double)SamplingFreq,
-		        (double)R_circle,
-		        (double)(freq_circle / (2.0f * (float)M_PI)),
-		        (double)profileRampSeconds);
+		        (double)profileRadius_mm,
+		        (double)profileFrequency_Hz,
+		        (double)profileRampSeconds,
+		        (double)profilePetalNum,
+		        (double)profilePetalTurn);
 #endif
 		    HAL_UART_Transmit(&huart2, (uint8_t*)UARTTXBuffer, UARTTXLen, 100);
 
@@ -1072,52 +1099,80 @@ case PRINT_COMMAND: {
 
 		case PETAL_COMMAND:
 
-			if (LogCounter == 0) {
+			if (LogCounter == 0 && STPOS == 0) {
+                if (ILC_ActiveProfileCommand != PETAL_COMMAND) {
+                    // Start PETAL with zero correction when switching from another path.
+                    // Repeated PETAL trials retain and improve their own correction profile.
+                    ILC_ResetCorrections();
+                    ILC_ActiveProfileCommand = PETAL_COMMAND;
+                }
+
 				HAL_UART_DMAStop(&huart2);
-				UARTTXLen = sprintf((char*) UARTTXBuffer, "SINE COMMAND\n");
-				HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen,
-						100);
+				UARTTXLen = sprintf((char*) UARTTXBuffer, "COMMAND=PETAL\r\n");
+				HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen, 100);
+
+                // Calculate the exact PETAL point reached by the old 0.25-second ramp.
+                const float petalRampTheta =
+                    petal_turn * PETAL_RAMP_DURATION_S * petal_freq;
+                petalStartX_mm = petal_dim * cosf(petal_num * petalRampTheta)
+                                            * cosf(petalRampTheta);
+                petalStartY_mm = petal_dim * cosf(petal_num * petalRampTheta)
+                                            * sinf(petalRampTheta);
+
+                STPOS = 1;
 				StartActuators();
-				STPOS = 1;
 
-			} else if (LogCounter < 0.25f * SamplingFreq) {
+            } else if (LogCounter < PETAL_TOTAL_SAMPLES) {
+                // PETAL reference, error recording, and current logging are in the ISR.
 
-			    // Compute the target point at t = 0.25 s
-			    float t_ramp_end  = 0.25f;
-			    float theta_ramp  = petal_turn * t_ramp_end * petal_freq;   // angle at ramp end
-			    float target_X    = petal_dim * cosf(petal_num * theta_ramp) * cosf(theta_ramp);
-			    float target_Y    = petal_dim * cosf(petal_num * theta_ramp) * sinf(theta_ramp);
+			} else {
+                SetControlParameters(0, MEASUREMENT_ONLY, 0.0f, 0.0f,
+                                     MEASUREMENT_ONLY, 0.0f, 0.0f, 0);
+                StopActuators();
 
-			    // Linear interpolation from (0,0) to (target_X, target_Y)
-			    float position_start_X = (target_X / (0.25f * SamplingFreq)) * (LogCounter);
-			    float position_start_Y = (target_Y / (0.25f * SamplingFreq)) * (LogCounter);
+                // Evaluate only the repeatable 1-second PETAL segment.
+                // The approach ramp and the hold at the PETAL start point are excluded.
+                float errorRMS_X = ILC_CalculateRMS(ilcErrorX_um);
+                float errorRMS_Y = ILC_CalculateRMS(ilcErrorY_um);
+                float errorRMS_X_SteadyState = ILC_CalculateRMS_SteadyState(ilcErrorX_um);
+                float errorRMS_Y_SteadyState = ILC_CalculateRMS_SteadyState(ilcErrorY_um);
 
-			    SetControlParameters(1, POSITION_CONTROL,
-			                         position_start_X, position_start_Y,
-			                         DONT_CHANGE_IT, 0, 0, 0);
+#if ILC_USE_MODEL_INVERSE
+                ModelInverseILC_Update();
+#else
+                PDILC_Update();
+#endif
+                ILC_ActiveProfileCommand = PETAL_COMMAND;
 
-			} else if (LogCounter <= 2.5 * SamplingFreq) {
+                float correctionPeakX = ILC_MaxCorrection(ilcCorrectionX_um);
+                float correctionPeakY = ILC_MaxCorrection(ilcCorrectionY_um);
 
-		        float t     = (float)(LogCounter) / SamplingFreq;
-		        float theta = petal_turn * t * petal_freq;
-		        float x = petal_dim * cosf(petal_num * theta) * cosf(theta);
-		        float y = petal_dim * cosf(petal_num * theta) * sinf(theta);
+                ActiveCommand = IDLE_COMMAND;
+                STPOS = 0;
 
-		        SetControlParameters(1, POSITION_CONTROL, x, y,
-		                             DONT_CHANGE_IT, 0, 0, 0);
+                UARTTXLen = snprintf(
+                    (char*)UARTTXBuffer,
+                    UART_TX_BUFFER_SIZE - 1U,
+                    "PETAL finished. X=%.4f mm, Y=%.4f mm, "
+                    "RMS_X_full=%.6f mm, RMS_Y_full=%.6f mm, "
+                    "RMS_X_samples_%u_to_%u=%.6f mm, "
+                    "RMS_Y_samples_%u_to_%u=%.6f mm, "
+                    "correction_peak_X_next=%.5f mm, correction_peak_Y_next=%.5f mm\r\n",
+                    XActuator.MM.Position,
+                    YActuator.MM.Position,
+                    errorRMS_X,
+                    errorRMS_Y,
+                    (unsigned int)ILC_RMS_START_SAMPLE,
+                    (unsigned int)ILC_TRIAL_SAMPLES,
+                    errorRMS_X_SteadyState,
+                    (unsigned int)ILC_RMS_START_SAMPLE,
+                    (unsigned int)ILC_TRIAL_SAMPLES,
+                    errorRMS_Y_SteadyState,
+                    correctionPeakX,
+                    correctionPeakY);
 
-			} else if (LogCounter > 2.5 * SamplingFreq) {
-
-				SetControlParameters(0, MEASUREMENT_ONLY, 0, 0,
-				MEASUREMENT_ONLY, 0, 0, 0);
-				StopActuators();
-				ActiveCommand = IDLE_COMMAND;
-				STPOS = 0;
-				UARTTXLen = sprintf((char*) UARTTXBuffer, "Finished\n");
-				HAL_UART_Transmit(&huart2, (uint8_t*) UARTTXBuffer, UARTTXLen,
-						100);
+                HAL_UART_Transmit(&huart2, (uint8_t*)UARTTXBuffer, UARTTXLen, 100);
 			}
-
 			break;
 
 //		case EPICYCLOID_COMMAND:
@@ -2812,6 +2867,52 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
         }
     }
 
+
+    // PETAL ILC uses a ramp, repeatable one-second petal segment, then a hold.
+    if (ActiveCommand == PETAL_COMMAND) {
+        if (LogCounter < PETAL_RAMP_SAMPLES) {
+            // The approach ramp is deliberately unlearned.
+            const float rampFraction =
+                (float)LogCounter / (float)PETAL_RAMP_SAMPLES;
+            xReference = petalStartX_mm * rampFraction;
+            yReference = petalStartY_mm * rampFraction;
+
+            SetControlParameters(
+                1, POSITION_CONTROL, xReference, yReference,
+                DONT_CHANGE_IT, 0.0f, 0.0f, 0);
+
+        } else if (LogCounter < PETAL_TRIAL_END_SAMPLE) {
+            // Rebase k to zero just after the ramp. Because petal_num=5 is odd,
+            // the Cartesian petal shape repeats every 0.25 seconds; this 1-second
+            // learning window contains four complete repeats of the same path.
+            const uint32_t k = LogCounter - PETAL_RAMP_SAMPLES;
+            const float trialTime = (float)k / SamplingFreq;
+            const float rampEndTime = (float)PETAL_RAMP_SAMPLES / SamplingFreq;
+            const float theta = petal_turn * (rampEndTime + trialTime) * petal_freq;
+
+            xReference = petal_dim * cosf(petal_num * theta) * cosf(theta);
+            yReference = petal_dim * cosf(petal_num * theta) * sinf(theta);
+
+            const float commandedX =
+                xReference + ILC_MicrometresToMm(ilcCorrectionX_um[k]);
+            const float commandedY =
+                yReference + ILC_MicrometresToMm(ilcCorrectionY_um[k]);
+
+            SetControlParameters(
+                1, POSITION_CONTROL, commandedX, commandedY,
+                DONT_CHANGE_IT, 0.0f, 0.0f, 0);
+
+        } else if (LogCounter < PETAL_TOTAL_SAMPLES) {
+            // Hold at the same point where the ramp ends and PETAL learning starts.
+            xReference = petalStartX_mm;
+            yReference = petalStartY_mm;
+
+            SetControlParameters(
+                1, POSITION_CONTROL, petalStartX_mm, petalStartY_mm,
+                DONT_CHANGE_IT, 0.0f, 0.0f, 0);
+        }
+    }
+
 	if (YActuator.ControllerActive) {
 
 		switch (YActuator.MC.ControlMode) {
@@ -2841,6 +2942,18 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 
                 // Store only circular-segment errors. The approach ramp and
                 // the hold at the circle start point are not part of ILC.
+                ilcErrorX_um[k] = ILC_MmToMicrometres(
+                    xReference - XActuator.MM.Position);
+                ilcErrorY_um[k] = ILC_MmToMicrometres(
+                    yReference - YActuator.MM.Position);
+
+            } else if (ActiveCommand == PETAL_COMMAND &&
+                       LogCounter >= PETAL_RAMP_SAMPLES &&
+                       LogCounter < PETAL_TRIAL_END_SAMPLE) {
+
+                const uint32_t k = LogCounter - PETAL_RAMP_SAMPLES;
+
+                // Store only the repeatable PETAL segment, excluding ramp and hold.
                 ilcErrorX_um[k] = ILC_MmToMicrometres(
                     xReference - XActuator.MM.Position);
                 ilcErrorY_um[k] = ILC_MmToMicrometres(
@@ -3089,6 +3202,14 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
                    LogCounter >= CIRCLE_RAMP_SAMPLES &&
                    LogCounter < CIRCLE_TRIAL_END_SAMPLE) {
             currentTrialIndex = LogCounter - CIRCLE_RAMP_SAMPLES;
+            if ((currentTrialIndex % CURRENT_LOG_DECIMATION) == 0U) {
+                currentLogIndex = currentTrialIndex / CURRENT_LOG_DECIMATION;
+                saveCurrentSample = 1U;
+            }
+        } else if (ActiveCommand == PETAL_COMMAND &&
+                   LogCounter >= PETAL_RAMP_SAMPLES &&
+                   LogCounter < PETAL_TRIAL_END_SAMPLE) {
+            currentTrialIndex = LogCounter - PETAL_RAMP_SAMPLES;
             if ((currentTrialIndex % CURRENT_LOG_DECIMATION) == 0U) {
                 currentLogIndex = currentTrialIndex / CURRENT_LOG_DECIMATION;
                 saveCurrentSample = 1U;
