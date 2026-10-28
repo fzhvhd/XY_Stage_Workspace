@@ -15,7 +15,7 @@
 % The first trial after a command/profile switch is assumed to have u_ILC = 0.
 %
 % SIST is accepted as a legacy command name, but is always displayed as SINX.
-% Supported references: SINX, SINY, CIRC, and PETAL.
+% Supported references: SINX, SINY, CIRC, PETAL, LIS12 (1:2), and LIS23 (2:3).
 
 clc;
 clear;
@@ -42,6 +42,9 @@ emptyTrial = struct( ...
     'rampS', NaN, ...
     'petalNum', NaN, ...
     'petalTurn', NaN, ...
+    'lissajousFxHz', NaN, ...
+    'lissajousFyHz', NaN, ...
+    'lissajousPhaseDeg', NaN, ...
     'ilcMode', 'UNKNOWN', ...
     'beta', NaN, ...
     'ilcFcHz', NaN, ...
@@ -96,6 +99,9 @@ for lineIndex = 1:numel(loglines)
         currentTrial.rampS = metadata.rampS;
         currentTrial.petalNum = metadata.petalNum;
         currentTrial.petalTurn = metadata.petalTurn;
+        currentTrial.lissajousFxHz = metadata.lissajousFxHz;
+        currentTrial.lissajousFyHz = metadata.lissajousFyHz;
+        currentTrial.lissajousPhaseDeg = metadata.lissajousPhaseDeg;
         currentTrial.ilcMode = metadata.ilcMode;
         currentTrial.beta = metadata.beta;
         currentTrial.ilcFcHz = metadata.ilcFcHz;
@@ -177,9 +183,11 @@ for kTrial = 1:numTrials
         current = trials(kTrial);
         sameReference = strcmp(Command{kTrial}, Command{kTrial - 1}) && ...
             isequaln([current.R, current.freqHz, current.rampS, current.Fs, ...
-                      current.petalNum, current.petalTurn], ...
+                      current.petalNum, current.petalTurn, current.lissajousFxHz, ...
+                      current.lissajousFyHz, current.lissajousPhaseDeg], ...
                      [previous.R, previous.freqHz, previous.rampS, previous.Fs, ...
-                      previous.petalNum, previous.petalTurn]);
+                      previous.petalNum, previous.petalTurn, previous.lissajousFxHz, ...
+                      previous.lissajousFyHz, previous.lissajousPhaseDeg]);
         sameILCSettings = strcmp(current.ilcMode, previous.ilcMode) && ...
             isequaln([current.beta, current.ilcFcHz, current.kpX, current.kdX, ...
                       current.kpY, current.kdY], ...
@@ -226,6 +234,16 @@ for kTrial = 1:numTrials
             petalEnvelope = cos(trials(kTrial).petalNum .* theta);
             trials(kTrial).xReference = trials(kTrial).R .* petalEnvelope .* cos(theta);
             trials(kTrial).yReference = trials(kTrial).R .* petalEnvelope .* sin(theta);
+
+        case {'LIS12', 'LIS23'}
+            % Both axes use zero phase offset; t includes the unlearned ramp's
+            % elapsed time, matching the firmware reference precisely.
+            fx = trials(kTrial).lissajousFxHz;
+            fy = trials(kTrial).lissajousFyHz;
+            phaseY = deg2rad(trials(kTrial).lissajousPhaseDeg);
+            trajectoryTime = trials(kTrial).rampS + t;
+            trials(kTrial).xReference = trials(kTrial).R .* sin(2*pi*fx.*trajectoryTime);
+            trials(kTrial).yReference = trials(kTrial).R .* sin(2*pi*fy.*trajectoryTime + phaseY);
 
         otherwise
             warning('Unsupported command %s. Reference will be NaN.', trials(kTrial).command);
@@ -292,6 +310,9 @@ Sampling_Hz = NaN(numSequences, 1);
 Ramp_s = NaN(numSequences, 1);
 Petal_Num = NaN(numSequences, 1);
 Petal_Turn = NaN(numSequences, 1);
+Lissajous_FX_Hz = NaN(numSequences, 1);
+Lissajous_FY_Hz = NaN(numSequences, 1);
+Lissajous_Phase_Y_deg = NaN(numSequences, 1);
 ILC_Mode = cell(numSequences, 1);
 Beta = NaN(numSequences, 1);
 ILC_fc_Hz = NaN(numSequences, 1);
@@ -316,6 +337,9 @@ for iSeq = 1:numSequences
     Ramp_s(iSeq) = tr.rampS;
     Petal_Num(iSeq) = tr.petalNum;
     Petal_Turn(iSeq) = tr.petalTurn;
+    Lissajous_FX_Hz(iSeq) = tr.lissajousFxHz;
+    Lissajous_FY_Hz(iSeq) = tr.lissajousFyHz;
+    Lissajous_Phase_Y_deg(iSeq) = tr.lissajousPhaseDeg;
     ILC_Mode{iSeq} = tr.ilcMode;
     Beta(iSeq) = tr.beta;
     ILC_fc_Hz(iSeq) = tr.ilcFcHz;
@@ -328,9 +352,11 @@ end
 
 settingsTable = table(SettingsSequence, SettingsCommand, ReferenceSignal, ...
     R_mm, Frequency_Hz, Sampling_Hz, Ramp_s, Petal_Num, Petal_Turn, ...
+    Lissajous_FX_Hz, Lissajous_FY_Hz, Lissajous_Phase_Y_deg, ...
     ILC_Mode, Beta, ILC_fc_Hz, KPX, KDX, KPY, KDY, LoggedTrials, ...
     'VariableNames', {'Sequence','Command','ReferenceSignal','R_mm','Frequency_Hz', ...
-    'Sampling_Hz','Ramp_s','Petal_Num','Petal_Turn','ILC_Mode','Beta','ILC_fc_Hz', ...
+    'Sampling_Hz','Ramp_s','Petal_Num','Petal_Turn','Lissajous_FX_Hz', ...
+    'Lissajous_FY_Hz','Lissajous_Phase_Y_deg','ILC_Mode','Beta','ILC_fc_Hz', ...
     'KPX','KDX','KPY','KDY','LoggedTrials'});
 
 fprintf('Reference and ILC settings for each logged sequence:\n');
@@ -369,9 +395,10 @@ summaryTable = table(Command, TrialNumber, SampleCount, ...
     'PeakILC_X_Next_mm','PeakILC_Y_Next_mm'});
 disp(summaryTable);
 
-%% Generate six all-iteration figures plus three best-iteration figures per sequence
+%% Generate the existing iteration figures plus one error-colored path per iteration
 % Reference and ILC settings are printed in settingsTable, not displayed on figures.
 % RMS convergence is plotted as lines with markers (not bars).
+% Each error-colored path uses a sequence-wide color scale for fair comparison.
 for sequenceIndex = 1:numel(sequenceList)
     seqID = sequenceList(sequenceIndex);
     groupIndices = find(SequenceID == seqID);
@@ -380,6 +407,21 @@ for sequenceIndex = 1:numel(sequenceList)
     nGroup = numel(groupIndices);
     sequenceTitle = commandName;
     clrs = [1 0 0; lines(nGroup-1)];
+
+    % Use one common color scale across all iterations in this sequence.
+    % The pointwise Euclidean tracking error is sqrt(eX^2 + eY^2), in micrometers.
+    sequenceMaxPathError_um = 0;
+    for jj = 1:nGroup
+        ii = groupIndices(jj);
+        pathError_um = 1e3 * hypot(trials(ii).errorX(:), trials(ii).errorY(:));
+        finiteErrors = pathError_um(isfinite(pathError_um));
+        if ~isempty(finiteErrors)
+            sequenceMaxPathError_um = max(sequenceMaxPathError_um, max(finiteErrors));
+        end
+    end
+    if ~isfinite(sequenceMaxPathError_um) || sequenceMaxPathError_um <= 0
+        sequenceMaxPathError_um = 1;
+    end
 
     %% Figure 1: X and Y positions as subplots
     figure('Name', sprintf('%s positions', commandName, sequenceIndex), ...
@@ -440,6 +482,127 @@ for sequenceIndex = 1:numel(sequenceList)
     end
     title('2D trajectory'); xlabel('X (mm)'); ylabel('Y (mm)');
     legend('Location', 'eastoutside');
+
+    %% Additional figure: error-colored 2D trajectories for all iterations
+    % Four subplot columns are used. The number of rows adapts automatically
+    % to the number of iterations in this sequence. A single colorbar and a
+    % shared color scale make the error levels comparable between iterations.
+    nPathCols = 4;
+    nPathRows = ceil(nGroup / nPathCols);
+    figHeight = max(480, 285 * nPathRows + 90);
+    pathFig = figure('Name', sprintf('%s error-colored paths (%d iterations)', ...
+        commandName, nGroup), 'Color', 'w');
+    pathLayout = tiledlayout(pathFig, nPathRows, nPathCols, ...
+        'TileSpacing', 'compact', 'Padding', 'compact');
+    colormap(pathFig, jet(256));
+
+    for jj = 1:nGroup
+        ii = groupIndices(jj);
+        xActual = trials(ii).xMeasured(:);
+        yActual = trials(ii).yMeasured(:);
+        xDesired = trials(ii).xReference(:);
+        yDesired = trials(ii).yReference(:);
+        pathError_um = 1e3 * hypot(trials(ii).errorX(:), trials(ii).errorY(:));
+
+        nPath = min([numel(xActual), numel(yActual), numel(xDesired), ...
+                     numel(yDesired), numel(pathError_um)]);
+        xActual = xActual(1:nPath);
+        yActual = yActual(1:nPath);
+        xDesired = xDesired(1:nPath);
+        yDesired = yDesired(1:nPath);
+        pathError_um = pathError_um(1:nPath);
+
+        axPath = nexttile(pathLayout, jj);
+        hold(axPath, 'on');
+        grid(axPath, 'on');
+        axis(axPath, 'equal');
+        patch(axPath, [xActual; xActual(1)], ...
+              [yActual; yActual(1)], ...
+              [pathError_um; pathError_um(1)], ...
+              'EdgeColor', 'interp', 'FaceColor', 'none', ...
+              'LineWidth', 2.2, 'DisplayName', 'Actual path');
+        plot(axPath, xDesired, yDesired, 'k--', 'LineWidth', 1.2, ...
+            'DisplayName', 'Desired path');
+        clim(axPath, [0 sequenceMaxPathError_um]);
+        xlabel(axPath, 'X (mm)');
+        ylabel(axPath, 'Y (mm)');
+        title(axPath, sprintf('Iteration %d', TrialNumber(ii)));
+        box(axPath, 'on');
+    end
+
+    % One shared colorbar for all subplots in the tiled layout.
+    pathColorbar = colorbar;
+    pathColorbar.Layout.Tile = 'east';
+    pathColorbar.Label.String = 'Euclidean tracking error (\mum)';
+
+    %% Additional figure: error-colored 2D trajectories for ILC iterations only
+    % Same layout and styling as the previous figure, but iteration 0 is omitted.
+    % The shared color scale is calculated using only the ILC runs.
+    ilcGroupIndices = groupIndices(TrialNumber(groupIndices) > 0);
+    nILC = numel(ilcGroupIndices);
+
+    if nILC > 0
+        ilcMaxPathError_um = 0;
+        for jj = 1:nILC
+            ii = ilcGroupIndices(jj);
+            pathError_um = 1e3 * hypot(trials(ii).errorX(:), trials(ii).errorY(:));
+            finiteErrors = pathError_um(isfinite(pathError_um));
+            if ~isempty(finiteErrors)
+                ilcMaxPathError_um = max(ilcMaxPathError_um, max(finiteErrors));
+            end
+        end
+        if ~isfinite(ilcMaxPathError_um) || ilcMaxPathError_um <= 0
+            ilcMaxPathError_um = 1;
+        end
+
+        nILCPathCols = 4;
+        nILCPathRows = ceil(nILC / nILCPathCols);
+        ilcFigHeight = max(480, 285 * nILCPathRows + 90);
+        ilcPathFig = figure('Name', sprintf('%s error-colored paths (ILC iterations only, %d iterations)', ...
+            commandName, nILC), 'Color', 'w');
+        ilcPathLayout = tiledlayout(ilcPathFig, nILCPathRows, nILCPathCols, ...
+            'TileSpacing', 'compact', 'Padding', 'compact');
+        colormap(ilcPathFig, jet(256));
+
+        for jj = 1:nILC
+            ii = ilcGroupIndices(jj);
+            xActual = trials(ii).xMeasured(:);
+            yActual = trials(ii).yMeasured(:);
+            xDesired = trials(ii).xReference(:);
+            yDesired = trials(ii).yReference(:);
+            pathError_um = 1e3 * hypot(trials(ii).errorX(:), trials(ii).errorY(:));
+
+            nPath = min([numel(xActual), numel(yActual), numel(xDesired), ...
+                         numel(yDesired), numel(pathError_um)]);
+            xActual = xActual(1:nPath);
+            yActual = yActual(1:nPath);
+            xDesired = xDesired(1:nPath);
+            yDesired = yDesired(1:nPath);
+            pathError_um = pathError_um(1:nPath);
+
+            axILCPath = nexttile(ilcPathLayout, jj);
+            hold(axILCPath, 'on');
+            grid(axILCPath, 'on');
+            axis(axILCPath, 'equal');
+            patch(axILCPath, [xActual; xActual(1)], ...
+                  [yActual; yActual(1)], ...
+                  [pathError_um; pathError_um(1)], ...
+                  'EdgeColor', 'interp', 'FaceColor', 'none', ...
+                  'LineWidth', 2.2, 'DisplayName', 'Actual path');
+            plot(axILCPath, xDesired, yDesired, 'k--', 'LineWidth', 1.2, ...
+                'DisplayName', 'Desired path');
+            clim(axILCPath, [0 ilcMaxPathError_um]);
+            xlabel(axILCPath, 'X (mm)');
+            ylabel(axILCPath, 'Y (mm)');
+            title(axILCPath, sprintf('Iteration %d', TrialNumber(ii)));
+            box(axILCPath, 'on');
+        end
+
+        % Colorbar limits reflect only the ILC iterations, not iteration 0.
+        ilcPathColorbar = colorbar;
+        ilcPathColorbar.Layout.Tile = 'east';
+        ilcPathColorbar.Label.String = 'Euclidean tracking error (\mum)';
+    end
 
     %% Figure 4: Full-trial RMS convergence (line plot, preserved style)
     figure('Name', sprintf('%s full-trial RMS', commandName, sequenceIndex), ...
@@ -621,6 +784,10 @@ function commandName = canonicalCommand(rawCommand)
         commandName = 'SINX';
     elseif strcmp(commandName, 'PETL')
         commandName = 'PETAL';
+    elseif strcmp(commandName, 'LIS1') || strcmp(commandName, 'LS12')
+        commandName = 'LIS12';
+    elseif strcmp(commandName, 'LIS2') || strcmp(commandName, 'LS23')
+        commandName = 'LIS23';
     end
 end
 
@@ -637,6 +804,9 @@ function metadata = parseDataBeginHeader(lineText)
         'rampS', NaN, ...
         'petalNum', NaN, ...
         'petalTurn', NaN, ...
+        'lissajousFxHz', NaN, ...
+        'lissajousFyHz', NaN, ...
+        'lissajousPhaseDeg', NaN, ...
         'ilcMode', 'UNKNOWN', ...
         'beta', NaN, ...
         'ilcFcHz', NaN, ...
@@ -666,6 +836,12 @@ function metadata = parseDataBeginHeader(lineText)
                 metadata.petalNum = str2double(value);
             case 'petal_turn'
                 metadata.petalTurn = str2double(value);
+            case 'fx_hz'
+                metadata.lissajousFxHz = str2double(value);
+            case 'fy_hz'
+                metadata.lissajousFyHz = str2double(value);
+            case 'phase_deg'
+                metadata.lissajousPhaseDeg = str2double(value);
             case 'ilc'
                 metadata.ilcMode = upper(value);
             case 'beta'
@@ -701,6 +877,10 @@ function description = referenceDescriptionForCommand(commandName)
         case 'PETAL'
             description = ['theta=turn*2*pi*f*(t+ramp); X=R*cos(num*theta)*cos(theta); ' ...
                            'Y=R*cos(num*theta)*sin(theta)'];
+        case 'LIS12'
+            description = 'X=A*sin(2*pi*1*(t+ramp)); Y=A*sin(2*pi*2*(t+ramp)); phase=0';
+        case 'LIS23'
+            description = 'X=A*sin(2*pi*2*(t+ramp)); Y=A*sin(2*pi*3*(t+ramp)); phase=0';
         otherwise
             description = 'Reference equation unavailable';
     end

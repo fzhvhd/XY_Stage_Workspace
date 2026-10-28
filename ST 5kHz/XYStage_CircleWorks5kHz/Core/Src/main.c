@@ -147,6 +147,8 @@ typedef struct {
 #define EPITROCHOID_COMMAND					24
 #define CURRENT_PRINT_COMMAND				25  // Temporary X/Y current log output
 #define SINY_COMMAND                    26
+#define LISSAJOUS12_COMMAND             27  // Serial command: LIS1 (frequency ratio 1:2)
+#define LISSAJOUS23_COMMAND             28  // Serial command: LIS2 (frequency ratio 2:3)
 
 ////////////////////////////////////////////////////////////////////////////////
 /* Control Mode --------------------------------------------------------------*/
@@ -193,7 +195,7 @@ typedef struct {
 
 // ILC configuration
 #define ILC_BETA                  0.5f  // Used by model-inverse ILC only.
-#define ILC_USE_MODEL_INVERSE     1U    // 1: model inverse; 0: PD ILC, for both axes.
+#define ILC_USE_MODEL_INVERSE     0U    // 1: model inverse; 0: PD ILC, for both axes.
 #define ILC_MAX_CORRECTION_MM     2.0f
 #define MODEL_INVERSE_Q_FC_HZ     50.0f
 #define PDILC_Q_FC_HZ             50.0f
@@ -232,6 +234,20 @@ typedef struct {
 #define PETAL_TRIAL_END_SAMPLE  (PETAL_RAMP_SAMPLES + ILC_TRIAL_SAMPLES)
 #define PETAL_TOTAL_SAMPLES     (PETAL_TRIAL_END_SAMPLE + SINESTEP_SETTLE_SAMPLES)
 
+// Lissajous ILC uses the same 0.25 s approach, 1 s learned path, and 0.5 s hold.
+// Both axes use zero phase at the selected base time; the Y phase offset is 0 rad.
+#define LISSAJOUS_RAMP_DURATION_S  0.25f
+#define LISSAJOUS_RAMP_SAMPLES     ((uint32_t)(LISSAJOUS_RAMP_DURATION_S * SamplingFreq))
+#define LISSAJOUS_TRIAL_END_SAMPLE (LISSAJOUS_RAMP_SAMPLES + ILC_TRIAL_SAMPLES)
+#define LISSAJOUS_TOTAL_SAMPLES    (LISSAJOUS_TRIAL_END_SAMPLE + SINESTEP_SETTLE_SAMPLES)
+#define LISSAJOUS_A_X_MM           2.0f
+#define LISSAJOUS_A_Y_MM           2.0f
+#define LISSAJOUS_PHASE_Y_RAD      0.0f
+#define LISSAJOUS12_FX_HZ          5.0f
+#define LISSAJOUS12_FY_HZ          10.0f
+#define LISSAJOUS23_FX_HZ          4.0f
+#define LISSAJOUS23_FY_HZ          6.0f
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -260,7 +276,7 @@ DMA_HandleTypeDef hdma_usart2_tx;
 ////////////////////////////////////////////////////////////////////////////////
 __attribute__ ((section(".buffers"), used))
 char UARTTXBuffer[UART_TX_BUFFER_SIZE];
-uint8_t UARTTXLen;
+uint16_t UARTTXLen;
 uint8_t UARTRXBuffer[UART_RX_BUFFER_SIZE];
 
 volatile uint8_t ActiveCommand;
@@ -324,6 +340,10 @@ static volatile float circleStartY_mm = 0.0f;
 // Calculated at PETL startup; the ISR uses this same point for ramp end and hold.
 static volatile float petalStartX_mm = 0.0f;
 static volatile float petalStartY_mm = 0.0f;
+
+// Calculated at LISSAJOUS startup and reused for the approach ramp and settling hold.
+static volatile float lissajousStartX_mm = 0.0f;
+static volatile float lissajousStartY_mm = 0.0f;
 
 const float petal_freq = 2.0f * (2.0f * M_PI);   // = 4*pi rad/s (2 Hz)
 const float petal_dim =  3.0f;                 //radius of circle
@@ -572,6 +592,9 @@ case PRINT_COMMAND: {
 		    float profileFrequency_Hz = freq_circle / (2.0f * (float)M_PI);
 		    float profilePetalNum = 0.0f;
 		    float profilePetalTurn = 0.0f;
+		    float profileFx_Hz = profileFrequency_Hz;
+		    float profileFy_Hz = profileFrequency_Hz;
+		    float profilePhaseY_deg = 0.0f;
 		    if (ILC_ActiveProfileCommand == SINX_COMMAND) {
 		        profileName = "SINX";
 		    } else if (ILC_ActiveProfileCommand == SINY_COMMAND) {
@@ -586,6 +609,24 @@ case PRINT_COMMAND: {
 		        profileFrequency_Hz = petal_freq / (2.0f * (float)M_PI);
 		        profilePetalNum = petal_num;
 		        profilePetalTurn = petal_turn;
+		        profileFx_Hz = profileFrequency_Hz;
+		        profileFy_Hz = profileFrequency_Hz;
+		    } else if (ILC_ActiveProfileCommand == LISSAJOUS12_COMMAND) {
+		        profileName = "LIS12";
+		        profileRampSeconds = LISSAJOUS_RAMP_DURATION_S;
+		        profileRadius_mm = LISSAJOUS_A_X_MM;
+		        profileFrequency_Hz = LISSAJOUS12_FX_HZ;
+		        profileFx_Hz = LISSAJOUS12_FX_HZ;
+		        profileFy_Hz = LISSAJOUS12_FY_HZ;
+		        profilePhaseY_deg = LISSAJOUS_PHASE_Y_RAD * 180.0f / (float)M_PI;
+		    } else if (ILC_ActiveProfileCommand == LISSAJOUS23_COMMAND) {
+		        profileName = "LIS23";
+		        profileRampSeconds = LISSAJOUS_RAMP_DURATION_S;
+		        profileRadius_mm = LISSAJOUS_A_X_MM;
+		        profileFrequency_Hz = LISSAJOUS23_FX_HZ;
+		        profileFx_Hz = LISSAJOUS23_FX_HZ;
+		        profileFy_Hz = LISSAJOUS23_FY_HZ;
+		        profilePhaseY_deg = LISSAJOUS_PHASE_Y_RAD * 180.0f / (float)M_PI;
 		    }
 
 #if ILC_USE_MODEL_INVERSE
@@ -594,7 +635,7 @@ case PRINT_COMMAND: {
 		    UARTTXLen = snprintf(
 		        (char*)UARTTXBuffer,
 		        UART_TX_BUFFER_SIZE - 1U,
-		        "DATA_BEGIN,ILC=MI,beta=%.6f,fc_Hz=%.6f,command=%s,samples=%u,Fs_Hz=%.0f,R_mm=%.6f,freq_Hz=%.6f,ramp_s=%.6f,petal_num=%.6f,petal_turn=%.6f\r\n",
+		        "DATA_BEGIN,ILC=MI,beta=%.6f,fc_Hz=%.6f,command=%s,samples=%u,Fs_Hz=%.0f,R_mm=%.6f,freq_Hz=%.6f,ramp_s=%.6f,petal_num=%.6f,petal_turn=%.6f,fx_Hz=%.6f,fy_Hz=%.6f,phase_deg=%.6f\r\n",
 		        (double)ILC_BETA,
 		        (double)MODEL_INVERSE_Q_FC_HZ,
 		        profileName,
@@ -604,12 +645,15 @@ case PRINT_COMMAND: {
 		        (double)profileFrequency_Hz,
 		        (double)profileRampSeconds,
 		        (double)profilePetalNum,
-		        (double)profilePetalTurn);
+		        (double)profilePetalTurn,
+		        (double)profileFx_Hz,
+		        (double)profileFy_Hz,
+		        (double)profilePhaseY_deg);
 #else
 		    UARTTXLen = snprintf(
 		        (char*)UARTTXBuffer,
 		        UART_TX_BUFFER_SIZE - 1U,
-		        "DATA_BEGIN,ILC=PD,KPX=%.6f,KDX=%.6f,KPY=%.6f,KDY=%.6f,fc_Hz=%.6f,command=%s,samples=%u,Fs_Hz=%.0f,R_mm=%.6f,freq_Hz=%.6f,ramp_s=%.6f,petal_num=%.6f,petal_turn=%.6f\r\n",
+		        "DATA_BEGIN,ILC=PD,KPX=%.6f,KDX=%.6f,KPY=%.6f,KDY=%.6f,fc_Hz=%.6f,command=%s,samples=%u,Fs_Hz=%.0f,R_mm=%.6f,freq_Hz=%.6f,ramp_s=%.6f,petal_num=%.6f,petal_turn=%.6f,fx_Hz=%.6f,fy_Hz=%.6f,phase_deg=%.6f\r\n",
 		        (double)PDILC_KP_X,
 		        (double)PDILC_KD_X,
 		        (double)PDILC_KP_Y,
@@ -622,7 +666,10 @@ case PRINT_COMMAND: {
 		        (double)profileFrequency_Hz,
 		        (double)profileRampSeconds,
 		        (double)profilePetalNum,
-		        (double)profilePetalTurn);
+		        (double)profilePetalTurn,
+		        (double)profileFx_Hz,
+		        (double)profileFy_Hz,
+		        (double)profilePhaseY_deg);
 #endif
 		    HAL_UART_Transmit(&huart2, (uint8_t*)UARTTXBuffer, UARTTXLen, 100);
 
@@ -1174,6 +1221,87 @@ case PRINT_COMMAND: {
                 HAL_UART_Transmit(&huart2, (uint8_t*)UARTTXBuffer, UARTTXLen, 100);
 			}
 			break;
+
+        case LISSAJOUS12_COMMAND:
+        case LISSAJOUS23_COMMAND: {
+            const uint8_t isRatio12 = (ActiveCommand == LISSAJOUS12_COMMAND);
+            const float lissFx_Hz = isRatio12 ? LISSAJOUS12_FX_HZ : LISSAJOUS23_FX_HZ;
+            const float lissFy_Hz = isRatio12 ? LISSAJOUS12_FY_HZ : LISSAJOUS23_FY_HZ;
+            const char *lissName = isRatio12 ? "LIS12" : "LIS23";
+
+            if (LogCounter == 0 && STPOS == 0) {
+                if (ILC_ActiveProfileCommand != ActiveCommand) {
+                    // Never reuse a correction profile between different Lissajous ratios.
+                    ILC_ResetCorrections();
+                    ILC_ActiveProfileCommand = ActiveCommand;
+                }
+
+                HAL_UART_DMAStop(&huart2);
+                UARTTXLen = snprintf((char *)UARTTXBuffer, UART_TX_BUFFER_SIZE - 1U,
+                                     "COMMAND=%s\r\n", lissName);
+                HAL_UART_Transmit(&huart2, (uint8_t *)UARTTXBuffer, UARTTXLen, 100);
+
+                // Compute the exact reference point at the end of the unlearned ramp.
+                const float rampEndTime = (float)LISSAJOUS_RAMP_SAMPLES / SamplingFreq;
+                lissajousStartX_mm = LISSAJOUS_A_X_MM *
+                    sinf(2.0f * (float)M_PI * lissFx_Hz * rampEndTime);
+                lissajousStartY_mm = LISSAJOUS_A_Y_MM *
+                    sinf(2.0f * (float)M_PI * lissFy_Hz * rampEndTime + LISSAJOUS_PHASE_Y_RAD);
+
+                STPOS = 1;
+                StartActuators();
+
+            } else if (LogCounter < LISSAJOUS_TOTAL_SAMPLES) {
+                // Lissajous reference, error recording, and current logging run in the ISR.
+
+            } else {
+                SetControlParameters(0, MEASUREMENT_ONLY, 0.0f, 0.0f,
+                                     MEASUREMENT_ONLY, 0.0f, 0.0f, 0);
+                StopActuators();
+
+                float errorRMS_X = ILC_CalculateRMS(ilcErrorX_um);
+                float errorRMS_Y = ILC_CalculateRMS(ilcErrorY_um);
+                float errorRMS_X_SteadyState = ILC_CalculateRMS_SteadyState(ilcErrorX_um);
+                float errorRMS_Y_SteadyState = ILC_CalculateRMS_SteadyState(ilcErrorY_um);
+
+#if ILC_USE_MODEL_INVERSE
+                ModelInverseILC_Update();
+#else
+                PDILC_Update();
+#endif
+                ILC_ActiveProfileCommand = ActiveCommand;
+
+                float correctionPeakX = ILC_MaxCorrection(ilcCorrectionX_um);
+                float correctionPeakY = ILC_MaxCorrection(ilcCorrectionY_um);
+
+                ActiveCommand = IDLE_COMMAND;
+                STPOS = 0;
+
+                UARTTXLen = snprintf(
+                    (char *)UARTTXBuffer,
+                    UART_TX_BUFFER_SIZE - 1U,
+                    "%s finished. X=%.4f mm, Y=%.4f mm, "
+                    "RMS_X_full=%.6f mm, RMS_Y_full=%.6f mm, "
+                    "RMS_X_samples_%u_to_%u=%.6f mm, "
+                    "RMS_Y_samples_%u_to_%u=%.6f mm, "
+                    "correction_peak_X_next=%.5f mm, correction_peak_Y_next=%.5f mm\r\n",
+                    lissName,
+                    XActuator.MM.Position,
+                    YActuator.MM.Position,
+                    errorRMS_X,
+                    errorRMS_Y,
+                    (unsigned int)ILC_RMS_START_SAMPLE,
+                    (unsigned int)ILC_TRIAL_SAMPLES,
+                    errorRMS_X_SteadyState,
+                    (unsigned int)ILC_RMS_START_SAMPLE,
+                    (unsigned int)ILC_TRIAL_SAMPLES,
+                    errorRMS_Y_SteadyState,
+                    correctionPeakX,
+                    correctionPeakY);
+                HAL_UART_Transmit(&huart2, (uint8_t *)UARTTXBuffer, UARTTXLen, 100);
+            }
+            break;
+        }
 
 //		case EPICYCLOID_COMMAND:
 //
@@ -2237,6 +2365,10 @@ volatile uint8_t ProcessSerialCommand(uint8_t *SerialCommand) {
 		ActiveCommand = CIRCLE_COMMAND;
 	else if (!strncmp("PETL", (const char*) SerialCommand, 4))
 		ActiveCommand = PETAL_COMMAND;
+	else if (!strncmp("LIS1", (const char*) SerialCommand, 4))
+		ActiveCommand = LISSAJOUS12_COMMAND;
+	else if (!strncmp("LIS2", (const char*) SerialCommand, 4))
+		ActiveCommand = LISSAJOUS23_COMMAND;
 	else if (!strncmp("EPIT", (const char*) SerialCommand, 4))
 		ActiveCommand = EPITROCHOID_COMMAND;
 	else if (!strncmp("SQUR", (const char*) SerialCommand, 4))
@@ -2913,6 +3045,56 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
         }
     }
 
+
+    // Lissajous ILC: serial command LIS1 selects 1:2; LIS2 selects 2:3.
+    if (ActiveCommand == LISSAJOUS12_COMMAND || ActiveCommand == LISSAJOUS23_COMMAND) {
+        const uint8_t isRatio12 = (ActiveCommand == LISSAJOUS12_COMMAND);
+        const float lissFx_Hz = isRatio12 ? LISSAJOUS12_FX_HZ : LISSAJOUS23_FX_HZ;
+        const float lissFy_Hz = isRatio12 ? LISSAJOUS12_FY_HZ : LISSAJOUS23_FY_HZ;
+
+        if (LogCounter < LISSAJOUS_RAMP_SAMPLES) {
+            // Unlearned ramp from the origin to the path point at t = 0.25 s.
+            const float rampFraction =
+                (float)LogCounter / (float)LISSAJOUS_RAMP_SAMPLES;
+            xReference = lissajousStartX_mm * rampFraction;
+            yReference = lissajousStartY_mm * rampFraction;
+
+            SetControlParameters(
+                1, POSITION_CONTROL, xReference, yReference,
+                DONT_CHANGE_IT, 0.0f, 0.0f, 0);
+
+        } else if (LogCounter < LISSAJOUS_TRIAL_END_SAMPLE) {
+            // Learning begins at t = ramp duration and repeats exactly every second.
+            const uint32_t k = LogCounter - LISSAJOUS_RAMP_SAMPLES;
+            const float trialTime = (float)k / SamplingFreq;
+            const float trajectoryTime =
+                ((float)LISSAJOUS_RAMP_SAMPLES / SamplingFreq) + trialTime;
+
+            xReference = LISSAJOUS_A_X_MM *
+                sinf(2.0f * (float)M_PI * lissFx_Hz * trajectoryTime);
+            yReference = LISSAJOUS_A_Y_MM *
+                sinf(2.0f * (float)M_PI * lissFy_Hz * trajectoryTime + LISSAJOUS_PHASE_Y_RAD);
+
+            const float commandedX =
+                xReference + ILC_MicrometresToMm(ilcCorrectionX_um[k]);
+            const float commandedY =
+                yReference + ILC_MicrometresToMm(ilcCorrectionY_um[k]);
+
+            SetControlParameters(
+                1, POSITION_CONTROL, commandedX, commandedY,
+                DONT_CHANGE_IT, 0.0f, 0.0f, 0);
+
+        } else if (LogCounter < LISSAJOUS_TOTAL_SAMPLES) {
+            // Keep feedback enabled and hold at the same point that starts the path.
+            xReference = lissajousStartX_mm;
+            yReference = lissajousStartY_mm;
+
+            SetControlParameters(
+                1, POSITION_CONTROL, lissajousStartX_mm, lissajousStartY_mm,
+                DONT_CHANGE_IT, 0.0f, 0.0f, 0);
+        }
+    }
+
 	if (YActuator.ControllerActive) {
 
 		switch (YActuator.MC.ControlMode) {
@@ -2954,6 +3136,17 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
                 const uint32_t k = LogCounter - PETAL_RAMP_SAMPLES;
 
                 // Store only the repeatable PETAL segment, excluding ramp and hold.
+                ilcErrorX_um[k] = ILC_MmToMicrometres(
+                    xReference - XActuator.MM.Position);
+                ilcErrorY_um[k] = ILC_MmToMicrometres(
+                    yReference - YActuator.MM.Position);
+
+            } else if ((ActiveCommand == LISSAJOUS12_COMMAND ||
+                        ActiveCommand == LISSAJOUS23_COMMAND) &&
+                       LogCounter >= LISSAJOUS_RAMP_SAMPLES &&
+                       LogCounter < LISSAJOUS_TRIAL_END_SAMPLE) {
+
+                const uint32_t k = LogCounter - LISSAJOUS_RAMP_SAMPLES;
                 ilcErrorX_um[k] = ILC_MmToMicrometres(
                     xReference - XActuator.MM.Position);
                 ilcErrorY_um[k] = ILC_MmToMicrometres(
@@ -3210,6 +3403,15 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
                    LogCounter >= PETAL_RAMP_SAMPLES &&
                    LogCounter < PETAL_TRIAL_END_SAMPLE) {
             currentTrialIndex = LogCounter - PETAL_RAMP_SAMPLES;
+            if ((currentTrialIndex % CURRENT_LOG_DECIMATION) == 0U) {
+                currentLogIndex = currentTrialIndex / CURRENT_LOG_DECIMATION;
+                saveCurrentSample = 1U;
+            }
+        } else if ((ActiveCommand == LISSAJOUS12_COMMAND ||
+                    ActiveCommand == LISSAJOUS23_COMMAND) &&
+                   LogCounter >= LISSAJOUS_RAMP_SAMPLES &&
+                   LogCounter < LISSAJOUS_TRIAL_END_SAMPLE) {
+            currentTrialIndex = LogCounter - LISSAJOUS_RAMP_SAMPLES;
             if ((currentTrialIndex % CURRENT_LOG_DECIMATION) == 0U) {
                 currentLogIndex = currentTrialIndex / CURRENT_LOG_DECIMATION;
                 saveCurrentSample = 1U;
